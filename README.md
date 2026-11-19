@@ -44,4 +44,4 @@ This project is not affiliated with or endorsed by Anthropic.
 
 ## License
 
-Apache License 2.0. See `research-box/LICENSE` and `research-box/NOTICE`. If you redistribute the skill, keep the NOTICE file, which carries the attribution above.
+Apache License 2.0. See `LICENSE` and `NOTICE`; copies sit inside `research-box/` so the skill folder is complete on its own. If you redistribute the skill, keep the NOTICE file, which carries the attribution above.

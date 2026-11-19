@@ -61,11 +61,7 @@ Manifests can also be verified without the script: `shasum -a 256 -c manifest-sh
 
 ## Install
 
-The skill follows the open Agent Skills format (agentskills.io). Copy the `research-box` folder into your agent's skills directory, or upload it as a skill in an app that supports skills. You can also install it with the skills CLI:
-
-```
-npx skills add PaoloTCS/research-box
-```
+The skill follows the open Agent Skills format (agentskills.io). Copy the `research-box` folder into your agent's skills directory, or upload it as a skill in an app that supports skills.
 
 ## Versions
 

@@ -1,0 +1,69 @@
+{
+  "box": "prime-numbers",
+  "title": "Prime numbers and addressing",
+  "description": "Notes, a results table and code from a study of prime-based addressing schemes.",
+  "created": "2026-11-19",
+  "dropped": "2026-11-19",
+  "author": "A. Researcher",
+  "default_sharing": "same-assistant",
+  "topics": [
+    "primes",
+    "addressing",
+    "hierarchies"
+  ],
+  "state": [
+    "The single-hierarchy experiment is done; the ensemble version is running.",
+    {
+      "text": "Open question: which distance to use between addresses.",
+      "sharing": "private"
+    }
+  ],
+  "items": [
+    {
+      "item": "Working notes",
+      "kind": "document",
+      "live": "https://example.com/notes",
+      "snapshot": [
+        "doc/working-notes.pdf"
+      ],
+      "sharing": "same-assistant",
+      "revision": 7
+    },
+    {
+      "item": "Results table",
+      "kind": "spreadsheet",
+      "live": "https://example.com/results",
+      "snapshot": [
+        "sheet/results.xlsx"
+      ],
+      "sharing": "shareable"
+    },
+    {
+      "item": "Simulation",
+      "kind": "code",
+      "live": null,
+      "snapshot": [
+        "code/simulate.py"
+      ],
+      "sharing": "shareable"
+    },
+    {
+      "item": "Planning chat",
+      "kind": "chat",
+      "live": "https://example.com/chat",
+      "snapshot": [],
+      "sharing": "private"
+    }
+  ],
+  "public": {
+    "title": "Prime-based addressing",
+    "description": "A results table and simulation code for prime-based addressing schemes.",
+    "topics": [
+      "primes",
+      "addressing"
+    ]
+  },
+  "private_terms": [
+    "working notes"
+  ]
+}

@@ -41,6 +41,7 @@ research-box/
   assets/box.example.json      an example box
   LICENSE                      Apache License 2.0
   NOTICE                       copyright and attribution
+.claude-plugin/                plugin manifest, marketplace file and icon
 examples/prime-numbers/        a small box to try the script on
 tests/test_build_box.py        unittest suite, standard library only
 ```
@@ -67,8 +68,19 @@ The skill follows the open Agent Skills format (agentskills.io). Copy the `resea
 npx skills add PaoloTCS/research-box
 ```
 
+In Claude Code, the repository is also a plugin marketplace, so the skill installs as a plugin in one step:
+
+```
+/plugin install research-box --marketplace PaoloTCS/research-box
+```
+
+## What it runs
+
+The skill tells the agent to run `research-box/scripts/build_box.py`, a Python script that uses the standard library only. It reads and writes files in the box folder you name and in the `--out` folder, and nothing else. It makes no network calls, sends nothing anywhere, and never deletes files. The live links a box lists are opened by the agent with its own tools, not by the script.
+
 ## Versions
 
+- **0.2.4** (November 19, 2026): packaged as a Claude Code plugin (`.claude-plugin/plugin.json` and a one-plugin marketplace), with an icon and a note on what the script runs. No change to the skill or the script.
 - **0.2.3** (November 19, 2026), after a third outside review: state-line labels survive repeated exports; fields outside the format are never copied into a drop; a missing declared snapshot, or one file listed under two sharing levels, refuses the drop; `--check` returns 2 (incomplete) without a tag manifest; watch words are scanned in every generated file, and `--strict` refuses a shareable drop that contains them; clearer wording on what checksums do and do not prove. 23 tests.
 - **0.2.2** (November 19, 2026), after a second outside review: snapshot paths must stay inside the box folder (absolute paths, `..` and outside symlinks are refused before anything is written, and `--check` flags manifest paths outside the folder); `--help` and usage errors print usage instead of a traceback; a runnable example box and a 15-test suite (23 tests as of 0.2.3).
 - **0.2.1** (November 19, 2026), after review by an early user: `--out` is required for any drop that holds something back, so held-back files can never be left beside shared ones; `--check` exits 1 on any changed, missing or unlisted file and 2 with no manifest, so pipelines can gate on it.

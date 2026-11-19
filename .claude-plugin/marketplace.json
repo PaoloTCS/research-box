@@ -1,0 +1,15 @@
+{
+  "name": "research-box",
+  "owner": {
+    "name": "Paolo Pignatelli",
+    "url": "https://github.com/PaoloTCS"
+  },
+  "description": "Paolo Pignatelli's research-box Agent Skill, packaged as a Claude Code plugin.",
+  "plugins": [
+    {
+      "name": "research-box",
+      "source": "./",
+      "description": "Bundle related research work into named boxes with sharing levels that only narrow, RO-Crate metadata and checksummed snapshot drops."
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "name": "research-box",
+  "displayName": "Research Box",
+  "version": "0.2.4",
+  "description": "Bundle related research work into named boxes with sharing levels that only narrow, RO-Crate metadata and checksummed snapshot drops.",
+  "author": {
+    "name": "Paolo Pignatelli",
+    "url": "https://github.com/PaoloTCS"
+  },
+  "homepage": "https://github.com/PaoloTCS/research-box",
+  "repository": "https://github.com/PaoloTCS/research-box",
+  "license": "Apache-2.0",
+  "keywords": [
+    "research",
+    "reproducibility",
+    "ro-crate",
+    "bagit",
+    "checksums",
+    "agent-skills"
+  ],
+  "documentationUrl": "https://github.com/PaoloTCS/research-box#readme",
+  "supportUrl": "https://github.com/PaoloTCS/research-box/issues",
+  "skills": [
+    "./research-box/"
+  ],
+  "icon": "./.claude-plugin/icon.png"
+}

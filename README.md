@@ -9,6 +9,28 @@ Say "make a box called prime-numbers", "add this sheet to the box", "drop the bo
 - **Sharing levels:** private, same assistant, shareable. A drop for wider readers leaves out what is not cleared for them, writes a clean copy that holds nothing else, and says what it left out.
 - **Checks:** `--check` tells you whether any file in a drop, including its own description, changed or was copied stale, and a list of watch words flags private terms that are about to leave in a shareable drop.
 
+## Quick demo
+
+From a clone of this repository, using the example box in `examples/prime-numbers`:
+
+![A terminal session: a shareable drop of the example box keeps two items, --check passes, then fails after one file is edited.](docs/quick-demo.gif)
+
+```
+$ python3 research-box/scripts/build_box.py examples/prime-numbers --for shareable --out /tmp/prime-share
+prime-numbers: 2 item(s) kept, 2 file(s) checksummed, written to /tmp/prime-share
+Left out for shareable readers: Working notes, Planning chat
+Watch words in code/simulate.py: Project Lantern (advisory; --strict refuses the drop)
+
+$ python3 research-box/scripts/build_box.py /tmp/prime-share --check
+All files match the manifest.
+
+$ printf '\n# edited\n' >> /tmp/prime-share/sheet/results.csv
+$ python3 research-box/scripts/build_box.py /tmp/prime-share --check
+Changed since the last drop: sheet/results.csv
+```
+
+`--check` exits 0 when the drop matches its manifests and 1 after the edit. Add `--strict` to the first command and the drop is refused until the watch word is removed.
+
 ## Contents
 
 ```
@@ -27,9 +49,9 @@ tests/test_build_box.py        unittest suite, standard library only
 
 ## Try it
 
+The commands and the output in [Quick demo](#quick-demo) were run against this revision. To run the 23-test suite:
+
 ```
-python3 research-box/scripts/build_box.py examples/prime-numbers --for shareable --out /tmp/prime-share
-python3 research-box/scripts/build_box.py /tmp/prime-share --check
 python3 -m unittest discover tests
 ```
 

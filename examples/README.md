@@ -7,4 +7,4 @@ python3 research-box/scripts/build_box.py examples/prime-numbers --for shareable
 python3 research-box/scripts/build_box.py /tmp/prime-share --check
 ```
 
-The first command keeps the two shareable items, leaves out the rest, and reports the watch word in `code/simulate.py`. The second exits 0 while the copy is untouched.
+The first command keeps the two shareable items, leaves out the rest, and reports the watch word in `code/simulate.py`. The second exits 0 while the copy is untouched. Add `--strict` to the first command and the drop is refused until the watch word is removed.

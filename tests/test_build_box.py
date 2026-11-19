@@ -143,6 +143,70 @@ class BuildBoxTests(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("outside the folder", r.stdout)
 
+    def test_check_without_tag_manifest_is_incomplete(self):
+        out = self.make_drop()
+        (out / "tagmanifest-sha256.txt").unlink()
+        with open(out / "BOX.md", "a") as f:
+            f.write("edited\n")
+        self.assertEqual(run(out, "--check").returncode, 2)
+
+    # Labels, fields and files (findings from a second review)
+    def test_private_state_line_survives_re_export(self):
+        first = self.tmp / "private-copy"
+        self.assertEqual(run(self.box, "--out", first).returncode, 0)
+        second = self.tmp / "assistant-copy"
+        r = run(first, "--for", "same-assistant", "--out", second)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Open question", (second / "BOX.md").read_text())
+        self.assertNotIn("Open question", (second / "box.json").read_text())
+
+    def test_fields_outside_the_format_are_not_copied(self):
+        def add(d):
+            d["internal_note"] = "budget"
+            d["items"][1]["secret_tag"] = "x"
+        self.edit_box(add)
+        out = self.tmp / "share"
+        r = run(self.box, "--for", "shareable", "--out", out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        copy = (out / "box.json").read_text()
+        self.assertNotIn("internal_note", copy)
+        self.assertNotIn("secret_tag", copy)
+
+    def test_fields_outside_the_format_require_out(self):
+        self.edit_box(lambda d: d.update(internal_note="budget"))
+        r = run(self.box, "--for", "same-assistant")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("outside the format", r.stderr)
+
+    def test_missing_snapshot_is_refused(self):
+        (self.box / "sheet" / "results.csv").unlink()
+        out = self.tmp / "share"
+        r = run(self.box, "--for", "shareable", "--out", out)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not found", r.stderr)
+        self.assertFalse(out.exists())
+
+    def test_one_file_under_two_levels_is_refused(self):
+        self.edit_box(lambda d: d["items"][1]["snapshot"].append("doc/./working-notes.md"))
+        out = self.tmp / "share"
+        r = run(self.box, "--for", "shareable", "--out", out)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("different sharing levels", r.stderr)
+        self.assertFalse(out.exists())
+
+    def test_strict_mode_refuses_watch_words(self):
+        out = self.tmp / "share"
+        r = run(self.box, "--for", "shareable", "--out", out, "--strict")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Strict mode", r.stderr)
+        self.assertFalse(out.exists())
+
+    def test_watch_words_are_found_in_generated_files(self):
+        self.edit_box(lambda d: d["items"][1].update(notes="from Project Lantern"))
+        r = run(self.box, "--for", "shareable", "--out", self.tmp / "share")
+        self.assertIn("Watch words in BOX.md", r.stdout)
+        self.assertIn("Watch words in box.json", r.stdout)
+
     def test_check_without_manifest_exits_2(self):
         empty = self.tmp / "empty"
         empty.mkdir()

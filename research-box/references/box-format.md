@@ -52,18 +52,19 @@ A dropped box is a folder:
 
 - `sharing` is one of `private`, `same-assistant` or `shareable`.
 - `live` is a URL or `null`.
-- `snapshot` lists paths relative to the box folder, or is empty. Each path must stay inside the folder: absolute paths, `..` and symlinks that lead outside are refused before anything is written.
+- `snapshot` lists paths relative to the box folder, or is empty. Each path must stay inside the folder: absolute paths, `..` and symlinks that lead outside are refused before anything is written. Every listed file must exist when a drop includes the item; a file you deliberately do not copy goes in `notes`, with `snapshot` empty. One file may not be listed under items with different sharing levels.
 - `kind` is free text: document, spreadsheet, diagram, code, data, source file, chat, agent task, scheduled task.
 - `revision` (optional) is the live object's revision when the snapshot was made.
-- `state` lines are plain strings, which carry the box's default sharing, or objects with their own `sharing`.
+- `state` lines are plain strings, which carry the box's default sharing, or objects with their own `sharing`. Drops keep each line as written, so a label survives later exports.
 - `public` (optional) replaces title, description, topics and state in drops wider than `default_sharing`. Without it, such drops show only the box name.
 - `private_terms` (optional) are words the script looks for in shareable drops: item names, notes, state lines and text files. It reports each hit; binary files are listed for checking by eye.
 - `level_labels` (optional) maps the labels of the user's registry to the three levels.
+- Fields other than those above are never copied into a drop's `box.json`, and a drop for readers other than the user that would carry them must use `--out`.
 
 ## Building the manifest
 
 ```
-python3 scripts/build_box.py <box-folder> [--for shareable|same-assistant|private] [--out <new-folder>]
+python3 scripts/build_box.py <box-folder> [--for shareable|same-assistant|private] [--out <new-folder>] [--strict]
 python3 scripts/build_box.py <box-folder> --check
 python3 scripts/build_box.py --help
 ```
@@ -72,7 +73,8 @@ The script reads `<box-folder>/box.json` and writes `BOX.md`, `ro-crate-metadata
 
 - `--for` sets the audience. Items, state lines and box details narrower than the audience are left out of every output.
 - `--out` writes a clean copy into a new or empty folder: the cleared snapshot files, the generated files and a `box.json` filtered to the kept items. Shareable copies also lose `public`, `level_labels` and `private_terms`, since those name what was held back. `--out` is required whenever the drop holds anything back (items, state lines or the box's own details): without it the script refuses and writes nothing, so held-back files and a full `box.json` can never sit beside what is shared. A drop that holds nothing back may be written in place; the script then lists any files in the folder that the drop does not cover.
-- `--check` compares a dropped folder with `manifest-sha256.txt` and `tagmanifest-sha256.txt` and reports changed, missing and unlisted files. It writes nothing. Exit status: 0 when everything matches, 1 when a file changed, went missing or is not listed (or a manifest names a path outside the folder), 2 when there is no manifest or the command line is wrong. Scripts and pipelines can gate on it. Run it after every copy, at the destination, and before a refresh.
+- `--strict` refuses a shareable drop, writing nothing, when a watch word appears in any generated file or text snapshot. Without it, watch words are only reported.
+- `--check` compares a dropped folder with `manifest-sha256.txt` and `tagmanifest-sha256.txt` and reports changed, missing and unlisted files. It writes nothing. Exit status: 0 when everything matches, 1 when a file changed, went missing or is not listed (or a manifest names a path outside the folder), 2 when the check is incomplete (no manifest or no tag manifest) or the command line is wrong. Scripts and pipelines can gate on it. Run it after every copy, at the destination, and before a refresh.
 
 The script never deletes files. A manifest can also be checked without it: `shasum -a 256 -c manifest-sha256.txt` (macOS) or `sha256sum -c manifest-sha256.txt` (Linux).
 

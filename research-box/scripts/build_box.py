@@ -2,7 +2,7 @@
 """Build BOX.md, ro-crate-metadata.json and manifest-sha256.txt for a research box.
 
 Usage:
-  python3 build_box.py <box-folder> [--for shareable|same-assistant|private] [--out <folder>]
+  python3 build_box.py <box-folder> [--for shareable|same-assistant|private] [--out <folder>] [--strict]
   python3 build_box.py <box-folder> --check
   python3 build_box.py --help
 
@@ -18,8 +18,13 @@ Reads <box-folder>/box.json (format in references/box-format.md). Standard libra
 --check   Compare the folder's files with manifest-sha256.txt and tagmanifest-sha256.txt and
           report files that changed, went missing or are not in the manifests. Writes nothing.
           Exit status: 0 = everything matches, 1 = a file changed, went missing or is not
-          listed, 2 = no manifest to check against. Run it after every copy and before a
-          refresh.
+          listed, 2 = the check is incomplete (no manifest or no tag manifest). Run it after
+          every copy and before a refresh.
+--strict  Refuse a shareable drop, writing nothing, when a watch word (private_terms) appears
+          in any generated file or text snapshot. Without it, watch words are reported only.
+
+A drop is also refused, writing nothing, when a snapshot path leaves the box folder, a
+declared snapshot file is missing, or one file is listed under items with different levels.
 
 The script never deletes anything.
 """
@@ -32,6 +37,10 @@ from pathlib import Path, PurePath
 
 LEVELS = {"private": 0, "same-assistant": 1, "shareable": 2}
 LABELS = {"private": "Private", "same-assistant": "Same assistant", "shareable": "Shareable"}
+BOX_KEYS = ["box", "title", "description", "created", "dropped", "author", "license",
+            "default_sharing", "topics", "state", "public", "level_labels", "private_terms",
+            "prepared_for", "items"]
+ITEM_KEYS = ["item", "kind", "live", "revision", "snapshot", "sharing", "notes"]
 GENERATED = {"BOX.md", "box.json", "ro-crate-metadata.json", "manifest-sha256.txt",
              "tagmanifest-sha256.txt"}
 TAGGED = ["BOX.md", "box.json", "ro-crate-metadata.json", "manifest-sha256.txt"]
@@ -80,7 +89,7 @@ def check(folder):
               "Compare against a copy you kept, or keep each old file as <name>.prev before "
               "replacing it.")
         return 2
-    recorded = {}
+    recorded, incomplete = {}, False
     for line in manifest.read_text(encoding="utf-8").splitlines():
         if line.strip():
             h, rel = line.split("  ", 1)
@@ -92,7 +101,9 @@ def check(folder):
                 h, rel = line.split("  ", 1)
                 recorded[rel] = h
     else:
-        print("No tagmanifest-sha256.txt: BOX.md and box.json are not covered by this check.")
+        print("No tagmanifest-sha256.txt: BOX.md and box.json cannot be verified, so this "
+              "check is incomplete.")
+        incomplete = True
     outside = [r for r in recorded if not inside(folder, r)]
     for r in outside:
         del recorded[r]
@@ -107,6 +118,9 @@ def check(folder):
             print(f"{label}: " + ", ".join(rows))
     if changed or missing or extra or outside:
         return 1
+    if incomplete:
+        print("The snapshot files match, but the check is incomplete.")
+        return 2
     print("All files match the manifest.")
     return 0
 
@@ -123,9 +137,11 @@ def parse(argv):
                    help="audience of the drop (default: private)")
     p.add_argument("--out", type=Path, metavar="NEW_FOLDER",
                    help="write a clean copy here; required when the drop holds anything back")
+    p.add_argument("--strict", action="store_true",
+                   help="refuse a shareable drop, writing nothing, if any watch word is found")
     p.add_argument("--check", action="store_true",
                    help="compare a dropped box with its manifests; exit 0 match, 1 difference, "
-                        "2 no manifest")
+                        "2 no manifest or no tag manifest (incomplete check)")
     return p.parse_args(argv[1:])
 
 
@@ -139,15 +155,33 @@ def main(argv):
         sys.exit(f"No box.json in {folder}.")
     box = json.loads((folder / "box.json").read_text(encoding="utf-8"))
 
-    # Every snapshot path must stay inside the box folder, so a box.json cannot pull in
-    # (or, with --out, write) files elsewhere. Checked for all items before anything is written.
-    bad = [rel for it in box["items"] for rel in it.get("snapshot", []) if not inside(folder, rel)]
-    if bad:
-        sys.exit("Snapshot paths must be relative paths inside the box folder; these are not: "
-                 + ", ".join(map(str, bad)) + ". Nothing was written.")
+    def refuse(message):
+        sys.exit(message + " Nothing was written.")
 
     def cleared(level):
         return LEVELS[level] >= LEVELS[audience]
+
+    # Every snapshot path must stay inside the box folder, so a box.json cannot pull in
+    # (or, with --out, write) files elsewhere.
+    bad = [rel for it in box["items"] for rel in it.get("snapshot", []) if not inside(folder, rel)]
+    if bad:
+        refuse("Snapshot paths must be relative paths inside the box folder; these are not: "
+               + ", ".join(map(str, bad)) + ".")
+
+    items = [dict(it, sharing=level_of(it.get("sharing"), box, f"item {it['item']!r}"))
+             for it in box["items"]]
+
+    # One file, one level: a file listed under items with different sharing levels is
+    # ambiguous, so the drop is refused until the box says which level it has.
+    levels_of = {}
+    for it in items:
+        for rel in it.get("snapshot", []):
+            key = (folder / rel).resolve()
+            levels_of.setdefault(key, {})[it["sharing"]] = rel
+    conflicts = [", ".join(sorted(set(v.values()))) for v in levels_of.values() if len(v) > 1]
+    if conflicts:
+        refuse("These files are listed under items with different sharing levels: "
+               + "; ".join(conflicts) + ". Give each file one level.")
 
     # Box details (title, description, topics, state) carry the box's default sharing.
     # For a wider audience, use the "public" block if there is one; otherwise show only
@@ -158,19 +192,21 @@ def main(argv):
     title = details.get("title", box["box"])
     description = details.get("description", "")
     topics = details.get("topics", [])
-    state, state_held = [], 0
+    state_entries, state_held = [], 0  # kept as written, so labels survive re-export
     for s in details.get("state", []):
-        if isinstance(s, str):
-            state.append(s)  # inherits the level of the block it sits in
-        elif cleared(level_of(s.get("sharing"), box, "state line")):
-            state.append(s["text"])
+        if isinstance(s, str) or cleared(level_of(s.get("sharing"), box, "state line")):
+            state_entries.append(s)
         else:
             state_held += 1
+    state = [s if isinstance(s, str) else s["text"] for s in state_entries]
 
-    kept, left_out = [], []
-    for it in box["items"]:
-        it = dict(it, sharing=level_of(it.get("sharing"), box, f"item {it['item']!r}"))
-        (kept if cleared(it["sharing"]) else left_out).append(it)
+    kept = [it for it in items if cleared(it["sharing"])]
+    left_out = [it for it in items if not cleared(it["sharing"])]
+
+    # Fields outside the format are never copied into a drop for other readers.
+    extra_box = [k for k in box if k not in BOX_KEYS]
+    extra_items = sorted({k for it in box["items"] for k in it if k not in ITEM_KEYS})
+    extra_fields = extra_box + [f"items.{k}" for k in extra_items]
 
     # A drop that holds anything back must be a clean copy: written in place, the folder
     # would still hold the full box.json and the held-back files beside what is shared.
@@ -181,34 +217,33 @@ def main(argv):
         held.append(f"{state_held} state line(s)")
     if not use_box:
         held.append("the box's own details")
+    if extra_fields and audience != "private":
+        held.append(f"field(s) outside the format ({', '.join(extra_fields)})")
     if held and not out:
-        sys.exit(f"This {audience} drop holds back {', '.join(held)}. Write it as a clean copy: "
-                 f"add --out <new folder>. Nothing was written.")
+        refuse(f"This {audience} drop holds back {', '.join(held)}. Write it as a clean copy: "
+               f"add --out <new folder>.")
 
-    # Checksums of kept snapshot files.
-    sums, missing = [], []
+    # Every snapshot a kept item declares must exist. A file that is deliberately not
+    # copied belongs in the item's notes, with snapshot left empty.
+    missing = [rel for it in kept for rel in it.get("snapshot", []) if not (folder / rel).is_file()]
+    if missing:
+        refuse("Snapshot files listed but not found: " + ", ".join(missing)
+               + ". Export them, or move them to the item's notes if they are not copied.")
+    if out and out.exists() and any(out.iterdir()):
+        refuse(f"--out folder {out} is not empty.")
+
+    sums = []
     for it in kept:
         for rel in it.get("snapshot", []):
-            p = folder / rel
-            if p.is_file():
-                sums.append((sha256(p), rel, p.stat().st_size))
-            else:
-                missing.append(rel)
+            if rel not in [r for _, r, _ in sums]:
+                sums.append((sha256(folder / rel), rel, (folder / rel).stat().st_size))
 
-    target = folder
-    if out:
-        if out.exists() and any(out.iterdir()):
-            sys.exit(f"--out folder {out} is not empty")
-        out.mkdir(parents=True, exist_ok=True)
-        for _, rel, _ in sums:
-            (out / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(folder / rel, out / rel)
-        target = out
+    # Everything the drop will say is built in memory first, so the watch-word check can
+    # stop a strict drop before anything is written.
+    texts = {}
 
-    (target / "manifest-sha256.txt").write_text(
-        "".join(f"{h}  {rel}\n" for h, rel, _ in sums), encoding="utf-8")
+    texts["manifest-sha256.txt"] = "".join(f"{h}  {rel}\n" for h, rel, _ in sums)
 
-    # BOX.md
     lines = [f"# Box: {box['box']}", ""]
     if description:
         lines += [description, ""]
@@ -235,14 +270,15 @@ def main(argv):
     if state:
         lines += ["", "## State at drop time", ""] + [f"- {s}" for s in state]
     lines += ["", "## Integrity", "",
-              "Checksums of every snapshot file are in manifest-sha256.txt. "
-              "Cite a snapshot by box name, drop date and checksum, not by its live link."]
+              "manifest-sha256.txt holds a checksum of every snapshot file, and "
+              "tagmanifest-sha256.txt covers this file, box.json and the RO-Crate description. "
+              "They show whether the files still match what was dropped; they do not show that "
+              "the content is correct. Cite a snapshot by box name, drop date and checksum."]
     if left_out:
         lines += ["", f"{len(left_out)} item(s) were left out because they are not cleared for "
                       f"{LABELS[audience]} readers."]
-    (target / "BOX.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    texts["BOX.md"] = "\n".join(lines) + "\n"
 
-    # ro-crate-metadata.json (RO-Crate 1.1)
     graph = [
         {"@id": "ro-crate-metadata.json", "@type": "CreativeWork",
          "conformsTo": {"@id": "https://w3id.org/ro/crate/1.1"}, "about": {"@id": "./"}},
@@ -273,26 +309,62 @@ def main(argv):
         entities.append({"@id": "#author", "@type": "Person", "name": box["author"]})
     graph.append(root)
     graph += entities
-    (target / "ro-crate-metadata.json").write_text(
-        json.dumps({"@context": "https://w3id.org/ro/crate/1.1/context", "@graph": graph},
-                   indent=2, ensure_ascii=False), encoding="utf-8")
+    texts["ro-crate-metadata.json"] = json.dumps(
+        {"@context": "https://w3id.org/ro/crate/1.1/context", "@graph": graph},
+        indent=2, ensure_ascii=False)
 
     if out:
-        # A filtered box.json, so the copy does not list what was left out.
-        # Drops that stay with the same assistant keep the drop settings, so the drop can
-        # be refreshed in place; shareable drops lose them, since they name what is held back.
-        held = ("items", "title", "description", "topics", "state")
-        if audience == "shareable":
-            held += ("public", "level_labels", "private_terms")
-        filtered = {k: v for k, v in box.items() if k not in held}
-        filtered.update({k: v for k, v in (("title", title), ("description", description),
-                                           ("topics", topics), ("state", state)) if v})
-        filtered.update({"prepared_for": audience, "items": kept})
-        if not use_box:
-            filtered.pop("default_sharing", None)
-        (out / "box.json").write_text(json.dumps(filtered, indent=2, ensure_ascii=False) + "\n",
-                                      encoding="utf-8")
+        # The copy's box.json holds only fields of the format and only the kept items, with
+        # state lines as written, so a later export from the copy keeps every label.
+        keep_settings = audience != "shareable"
+        copy = {}
+        for k in ("box", "created", "dropped", "author", "license"):
+            if k in box:
+                copy[k] = box[k]
+        copy["default_sharing"] = box_level if use_box else audience
+        for k, v in (("title", title), ("description", description), ("topics", topics),
+                     ("state", state_entries)):
+            if v:
+                copy[k] = v
+        if keep_settings:
+            for k in ("public", "level_labels", "private_terms"):
+                if k in box:
+                    copy[k] = box[k]
+        copy["prepared_for"] = audience
+        copy["items"] = [{k: it[k] for k in ITEM_KEYS if k in it} for it in kept]
+        texts["box.json"] = json.dumps(copy, indent=2, ensure_ascii=False) + "\n"
+    else:
+        texts["box.json"] = (folder / "box.json").read_text(encoding="utf-8")
 
+    # Watch words: terms that should not reach other assistants or people. A shareable drop
+    # is scanned in full: every generated file and every text snapshot.
+    terms = [t for t in box.get("private_terms", []) if t]
+    hits, binaries = {}, []
+    if terms and audience == "shareable":
+        scan = dict(texts)
+        for _, rel, _ in sums:
+            try:
+                scan[rel] = (folder / rel).read_text(encoding="utf-8")
+            except (UnicodeDecodeError, ValueError):
+                binaries.append(rel)  # PDF, XLSX, PNG: check those by eye
+        for name, text in scan.items():
+            found = [t for t in terms if t.lower() in text.lower()]
+            if found:
+                hits[name] = found
+    if hits and args.strict:
+        refuse("Strict mode: watch words found in "
+               + "; ".join(f"{n} ({', '.join(f)})" for n, f in hits.items()) + ".")
+
+    target = out or folder
+    if out:
+        out.mkdir(parents=True, exist_ok=True)
+        for _, rel, _ in sums:
+            (out / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(folder / rel, out / rel)
+    for name in ("manifest-sha256.txt", "BOX.md", "ro-crate-metadata.json"):
+        (target / name).write_text(texts[name], encoding="utf-8")
+    if out:
+        (out / "box.json").write_text(texts["box.json"], encoding="utf-8")
     # Tag manifest (as in BagIt): checksums of the drop's own description files, so a
     # stale or edited BOX.md or box.json is caught as well as a changed snapshot.
     (target / "tagmanifest-sha256.txt").write_text(
@@ -301,32 +373,14 @@ def main(argv):
 
     print(f"{box['box']}: {len(kept)} item(s) kept, {len(sums)} file(s) checksummed"
           + (f", written to {out}" if out else ""))
-    if missing:
-        print("Snapshot files listed but not found: " + ", ".join(missing))
     if left_out:
         print(f"Left out for {audience} readers: " + ", ".join(it["item"] for it in left_out))
-    # Watch words: terms that should not reach other assistants or people. Scan what a
-    # shareable drop contains (names, notes, state and text files) and report every hit.
-    terms = [t for t in box.get("private_terms", []) if t]
-    if terms and audience == "shareable":
-        hits = {}
-        texts = [("BOX.md", (target / "BOX.md").read_text(encoding="utf-8"))]
-        for _, rel, _ in sums:
-            try:
-                texts.append((rel, (folder / rel).read_text(encoding="utf-8")))
-            except (UnicodeDecodeError, ValueError):
-                pass  # binary snapshot (PDF, XLSX, PNG): check those by eye
-        for name, text in texts:
-            low = text.lower()
-            found = [t for t in terms if t.lower() in low]
-            if found:
-                hits[name] = found
-        for name, found in hits.items():
-            print(f"Watch words in {name}: {', '.join(found)}")
-        binaries = [rel for _, rel, _ in sums if rel not in dict(texts)]
-        if binaries:
-            print("Not scanned for watch words (binary): " + ", ".join(binaries))
-
+    if extra_fields and out:
+        print("Fields outside the format, left out of the copy: " + ", ".join(extra_fields))
+    for name, found in hits.items():
+        print(f"Watch words in {name}: {', '.join(found)} (advisory; --strict refuses the drop)")
+    if binaries:
+        print("Not scanned for watch words (binary): " + ", ".join(binaries))
     if not out:
         listed = {rel for _, rel, _ in sums}
         unlisted = [r for r in all_files(folder) if r not in listed and r not in GENERATED]

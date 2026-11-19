@@ -5,14 +5,14 @@ license: Apache-2.0
 metadata:
   author: Paolo Pignatelli
   developed-with: Claude (Anthropic)
-  version: "0.2.2"
+  version: "0.2.3"
 ---
 
 # Research boxes
 
 A **box** is a named set of closely related work objects that travel together. It has two layers:
 
-- **Live layer:** links to the objects themselves (documents, spreadsheets, chats, agent tasks, published pages). Links stay current and are the source of truth.
+- **Live layer:** links to the objects themselves (documents, spreadsheets, chats, agent tasks, published pages). Links stay current and are the current working sources, which is not the same as being correct.
 - **Snapshot layer:** portable files exported from those objects at one moment (PDF, XLSX, PNG, code, data, source files), plus a manifest. Writing the snapshot to a folder is called **dropping** the box.
 
 Boxes are listed in a **registry**: a spreadsheet the user keeps, or a `boxes.json` file if they prefer files. If no registry exists when the user first asks for a box, create one with two tables:
@@ -39,7 +39,7 @@ Two rules hold everywhere:
 
 The box's own details (title, description, topics, state lines) carry the box's default sharing. For a wider drop, give a `public` block in `box.json` with wording cleared for those readers; without one, a wider drop shows only the box name.
 
-The user may mark topics or folders as never leaving their machine. Respect that above any level. Terms that must not reach other assistants can be listed as `private_terms`; the script reports every place a shareable drop still contains them, including files whose own level says Shareable.
+The user may mark topics or folders as never leaving their machine. Respect that above any level. Terms that must not reach other assistants can be listed as `private_terms`; the script reports every place a shareable drop still contains them, including generated files and files whose own level says Shareable. The report is advisory; with `--strict` the drop is refused and nothing is written until the terms are gone.
 
 ## Commands
 
@@ -85,7 +85,7 @@ Read its registry rows (all of them: a box's items need not be adjacent), or a `
 
 ## Citing a box
 
-When a result depends on a box's content, cite the **snapshot** (box name, drop date and the file's checksum), not the live link. A live object can change after the result was derived; a snapshot cannot.
+When a result depends on a box's content, cite the **snapshot** (box name, drop date and the file's checksum), not the live link. A live object can change after the result was derived. A snapshot is the designated fixed version: its files can still be edited, but the checksums show whether they still match what was dropped. Checksums do not establish that the content is correct, who wrote it, or that someone did not replace both the files and the manifests.
 
 ## Style
 

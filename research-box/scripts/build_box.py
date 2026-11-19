@@ -11,10 +11,14 @@ Reads <box-folder>/box.json (format in references/box-format.md). Standard libra
           audience are left out of every output.
 --out     Write a clean copy for that audience into a new or empty folder: only the kept
           snapshot files plus the generated files. The source folder is not touched.
-          Use it for every drop whose readers are wider than some of the folder's content.
---check   Compare the folder's files with manifest-sha256.txt and tagmanifest-sha256.txt and report files
-          that changed, went missing or are not in the manifest. Writes nothing. Run it before
-          a refresh, so hand edits are noticed before they are overwritten.
+          Required whenever the drop holds anything back (items, state lines or box
+          details); without it the script refuses, so nothing held back can sit beside
+          what is shared.
+--check   Compare the folder's files with manifest-sha256.txt and tagmanifest-sha256.txt and
+          report files that changed, went missing or are not in the manifests. Writes nothing.
+          Exit status: 0 = everything matches, 1 = a file changed, went missing or is not
+          listed, 2 = no manifest to check against. Run it after every copy and before a
+          refresh.
 
 The script never deletes anything.
 """
@@ -60,7 +64,7 @@ def check(folder):
         print("No manifest-sha256.txt: there is no baseline, so hand edits cannot be detected. "
               "Compare against a copy you kept, or keep each old file as <name>.prev before "
               "replacing it.")
-        return 1
+        return 2
     recorded = {}
     for line in manifest.read_text(encoding="utf-8").splitlines():
         if line.strip():
@@ -81,8 +85,9 @@ def check(folder):
                         ("Not in the manifest", extra)):
         if rows:
             print(f"{label}: " + ", ".join(rows))
-    if not (changed or missing or extra):
-        print("All files match the manifest.")
+    if changed or missing or extra:
+        return 1
+    print("All files match the manifest.")
     return 0
 
 
@@ -112,17 +117,32 @@ def main(argv):
     title = details.get("title", box["box"])
     description = details.get("description", "")
     topics = details.get("topics", [])
-    state = []
+    state, state_held = [], 0
     for s in details.get("state", []):
         if isinstance(s, str):
             state.append(s)  # inherits the level of the block it sits in
         elif cleared(level_of(s.get("sharing"), box, "state line")):
             state.append(s["text"])
+        else:
+            state_held += 1
 
     kept, left_out = [], []
     for it in box["items"]:
         it = dict(it, sharing=level_of(it.get("sharing"), box, f"item {it['item']!r}"))
         (kept if cleared(it["sharing"]) else left_out).append(it)
+
+    # A drop that holds anything back must be a clean copy: written in place, the folder
+    # would still hold the full box.json and the held-back files beside what is shared.
+    held = []
+    if left_out:
+        held.append(f"{len(left_out)} item(s)")
+    if state_held:
+        held.append(f"{state_held} state line(s)")
+    if not use_box:
+        held.append("the box's own details")
+    if held and not out:
+        sys.exit(f"This {audience} drop holds back {', '.join(held)}. Write it as a clean copy: "
+                 f"add --out <new folder>. Nothing was written.")
 
     # Checksums of kept snapshot files.
     sums, missing = [], []
@@ -269,8 +289,6 @@ def main(argv):
     if not out:
         listed = {rel for _, rel, _ in sums}
         unlisted = [r for r in all_files(folder) if r not in listed and r not in GENERATED]
-        if left_out:
-            unlisted.append("box.json (it still lists every item)")
         if unlisted:
             print("Files in the folder that this drop does not list (remove them, or use --out, "
                   "before others read the folder): " + ", ".join(unlisted))

@@ -5,7 +5,7 @@ license: Apache-2.0
 metadata:
   author: Paolo Pignatelli
   developed-with: Claude (Anthropic)
-  version: "0.2"
+  version: "0.2.1"
 ---
 
 # Research boxes
@@ -67,7 +67,7 @@ Add an Items row. A file with no live object gets its file name under "Snapshot 
    - `ro-crate-metadata.json`, an RO-Crate 1.1 description, so archives and research tools can read the box;
    - `manifest-sha256.txt`, checksums of every snapshot file, so a later reader can tell whether a file changed;
    - `tagmanifest-sha256.txt`, checksums of the files above, so a stale or edited `BOX.md` or `box.json` is caught too.
-   Use `--for <audience> --out <new folder>`: the clean copy holds only the cleared files and a `box.json` filtered to them, so nothing held back sits in the folder. If the script cannot run, write the same files by hand.
+   Use `--for <audience> --out <new folder>`: the clean copy holds only the cleared files and a `box.json` filtered to them, so nothing held back sits in the folder. The script refuses a drop that holds anything back unless `--out` is given. If the script cannot run, write the same files by hand.
 5. **Copy, verify and record.** Copy the clean folder to the location and run `--check` there; a copy is not done until the check passes at the destination. Then update Last dropped and Drop location in the registry. The registry keeps the full item list; a drop's `box.json` lists only what that drop holds.
 6. **Reply** in two or three lines: where it went, and anything left out and why.
 
@@ -79,7 +79,7 @@ Read its registry rows (all of them: a box's items need not be adjacent), or a `
 - For anyone else, hand over a drop filtered to items marked Shareable.
 
 ### Refresh a box ("refresh box X")
-1. Run `scripts/build_box.py <dropped folder> --check`. It compares the files with the last manifest and reports changes, missing files and files the manifest does not list.
+1. Run `scripts/build_box.py <dropped folder> --check`. It compares the files with the last manifests and reports changes, missing files and files they do not list; it exits 0 only when everything matches (1 for a difference, 2 for no manifest).
 2. If a snapshot was edited by hand since the last drop, say so instead of overwriting it. If there is no earlier manifest, compare against a copy you kept; otherwise keep each old file as `<name>.prev`.
 3. Rebuild the snapshots from the live objects (re-export only what changed; the revision tells you), regenerate the manifest for the same audience, copy, and update Last dropped.
 

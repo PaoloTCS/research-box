@@ -4,6 +4,7 @@
 Usage:
   python3 build_box.py <box-folder> [--for shareable|same-assistant|private] [--out <folder>]
   python3 build_box.py <box-folder> --check
+  python3 build_box.py --help
 
 Reads <box-folder>/box.json (format in references/box-format.md). Standard library only.
 
@@ -22,11 +23,12 @@ Reads <box-folder>/box.json (format in references/box-format.md). Standard libra
 
 The script never deletes anything.
 """
+import argparse
 import hashlib
 import json
 import shutil
 import sys
-from pathlib import Path
+from pathlib import Path, PurePath
 
 LEVELS = {"private": 0, "same-assistant": 1, "shareable": 2}
 LABELS = {"private": "Private", "same-assistant": "Same assistant", "shareable": "Shareable"}
@@ -51,6 +53,19 @@ def level_of(value, box, where):
         sys.exit(f"{where}: unknown sharing level {value!r}; use one of {', '.join(LEVELS)} "
                  f"or map it in level_labels")
     return value
+
+
+def inside(folder, rel):
+    """True if rel is a plain relative path that stays inside folder, symlinks resolved."""
+    pure = PurePath(rel)
+    if pure.is_absolute() or ".." in pure.parts or not str(rel).strip():
+        return False
+    root = Path(folder).resolve()
+    try:
+        (root / pure).resolve().relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def all_files(folder):
@@ -78,6 +93,11 @@ def check(folder):
                 recorded[rel] = h
     else:
         print("No tagmanifest-sha256.txt: BOX.md and box.json are not covered by this check.")
+    outside = [r for r in recorded if not inside(folder, r)]
+    for r in outside:
+        del recorded[r]
+    if outside:
+        print("Listed paths outside the folder (not read): " + ", ".join(outside))
     changed = [r for r, h in recorded.items() if (folder / r).is_file() and sha256(folder / r) != h]
     missing = [r for r in recorded if not (folder / r).is_file()]
     extra = [r for r in all_files(folder) if r not in recorded and r not in GENERATED]
@@ -85,25 +105,46 @@ def check(folder):
                         ("Not in the manifest", extra)):
         if rows:
             print(f"{label}: " + ", ".join(rows))
-    if changed or missing or extra:
+    if changed or missing or extra or outside:
         return 1
     print("All files match the manifest.")
     return 0
 
 
+def parse(argv):
+    p = argparse.ArgumentParser(
+        prog="build_box.py",
+        description="Build BOX.md, ro-crate-metadata.json and the checksum manifests for a "
+                    "research box, or check a dropped box against its manifests.",
+        epilog="The box.json format is in references/box-format.md. The script never deletes "
+               "anything.")
+    p.add_argument("folder", type=Path, help="the box folder (holds box.json, or a dropped box)")
+    p.add_argument("--for", dest="audience", choices=list(LEVELS), default="private",
+                   help="audience of the drop (default: private)")
+    p.add_argument("--out", type=Path, metavar="NEW_FOLDER",
+                   help="write a clean copy here; required when the drop holds anything back")
+    p.add_argument("--check", action="store_true",
+                   help="compare a dropped box with its manifests; exit 0 match, 1 difference, "
+                        "2 no manifest")
+    return p.parse_args(argv[1:])
+
+
 def main(argv):
-    if len(argv) < 2:
-        sys.exit(__doc__)
-    folder = Path(argv[1])
-    if "--check" in argv:
+    args = parse(argv)
+    folder = args.folder
+    if args.check:
         sys.exit(check(folder))
-    audience = "private"
-    if "--for" in argv:
-        audience = argv[argv.index("--for") + 1]
-        if audience not in LEVELS:
-            sys.exit(f"--for must be one of {', '.join(LEVELS)}")
-    out = Path(argv[argv.index("--out") + 1]) if "--out" in argv else None
+    audience, out = args.audience, args.out
+    if not (folder / "box.json").is_file():
+        sys.exit(f"No box.json in {folder}.")
     box = json.loads((folder / "box.json").read_text(encoding="utf-8"))
+
+    # Every snapshot path must stay inside the box folder, so a box.json cannot pull in
+    # (or, with --out, write) files elsewhere. Checked for all items before anything is written.
+    bad = [rel for it in box["items"] for rel in it.get("snapshot", []) if not inside(folder, rel)]
+    if bad:
+        sys.exit("Snapshot paths must be relative paths inside the box folder; these are not: "
+                 + ", ".join(map(str, bad)) + ". Nothing was written.")
 
     def cleared(level):
         return LEVELS[level] >= LEVELS[audience]

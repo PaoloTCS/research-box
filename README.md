@@ -19,7 +19,8 @@ From a clone of this repository, using the example box in `examples/prime-number
 $ python3 research-box/scripts/build_box.py examples/prime-numbers --for shareable --out /tmp/prime-share
 prime-numbers: 2 item(s) kept, 2 file(s) checksummed, written to /tmp/prime-share
 Left out for shareable readers: Working notes, Planning chat
-Watch words in code/simulate.py: Project Lantern (advisory; --strict refuses the drop)
+Held back for shareable readers: the box's own title, description, topics and state (the public block was used instead)
+Watch words in code/simulate.py line 1: Project Lantern ("...ch simulation. Left over from Project Lantern: the watch word check flags t...") (advisory; --strict refuses the drop)
 
 $ python3 research-box/scripts/build_box.py /tmp/prime-share --check
 All files match the manifest.
@@ -50,7 +51,7 @@ tests/test_build_box.py        unittest suite, standard library only
 
 ## Try it
 
-The commands and the output in [Quick demo](#quick-demo) were run against this revision. To run the 23-test suite:
+The commands and the output in [Quick demo](#quick-demo) were run against this revision. To run the 27-test suite:
 
 ```
 python3 -m unittest discover tests

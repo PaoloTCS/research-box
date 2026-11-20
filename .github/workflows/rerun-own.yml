@@ -1,0 +1,268 @@
+name: rerun in your own repository
+
+# Reusable workflow: reruns a research-box box three times with no network and signs the result
+# with GitHub's keyless artifact attestation (Sigstore). It runs in the CALLER's repository, on
+# the caller's own Actions minutes, and the attestation is stored there. The signature names
+# this workflow file at its exact commit, so anyone can check which code ran:
+#
+#   gh attestation verify report.json --repo YOU/YOUR-REPO \
+#     --signer-workflow PaoloTCS/research-box/.github/workflows/rerun-own.yml
+#
+# Call it from a workflow in your own repository (see .github/rerun/README.md):
+#
+#   jobs:
+#     rerun:
+#       permissions: { contents: read, id-token: write, attestations: write }
+#       uses: PaoloTCS/research-box/.github/workflows/rerun-own.yml@main
+#       with:
+#         box: path/to/your/box
+
+on:
+  workflow_call:
+    inputs:
+      box:
+        description: "path to a box folder in your repository (the folder with box.json)"
+        type: string
+        required: false
+        default: ""
+      drop_url:
+        description: "or: https address of a drop archive (.tar.gz of a folder made with --out)"
+        type: string
+        required: false
+        default: ""
+      drop_sha256:
+        description: "sha256 of that archive, as sha256sum prints it (needed with drop_url)"
+        type: string
+        required: false
+        default: ""
+      submitter:
+        description: "name or ORCID to show on the report"
+        type: string
+        required: false
+        default: ""
+      sign:
+        description: "sign the report; false reruns and checks but signs nothing"
+        type: boolean
+        required: false
+        default: true
+    outputs:
+      verdict:
+        description: "reproduced, did not reproduce, or inconclusive"
+        value: ${{ jobs.attest.outputs.verdict }}
+
+permissions: {}
+
+jobs:
+  tools:
+    # Finds which commit of this workflow is running, so every job uses the same tools.
+    # Runs nothing from the caller's repository.
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    timeout-minutes: 5
+    outputs:
+      repo: ${{ steps.who.outputs.repo }}
+      sha: ${{ steps.who.outputs.sha }}
+      workflow: ${{ steps.who.outputs.workflow }}
+    steps:
+      - name: Read this workflow's own identity from GitHub's OIDC token
+        id: who
+        run: |
+          python3 -I - >> "$GITHUB_OUTPUT" <<'EOF'
+          import base64, json, os, re, urllib.request
+          req = urllib.request.Request(
+              os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=research-box-rerun",
+              headers={"Authorization": "bearer " + os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          token = json.load(urllib.request.urlopen(req, timeout=30))["value"]
+          part = token.split(".")[1]
+          claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+          ref, sha = claims["job_workflow_ref"], claims["job_workflow_sha"]
+          m = re.fullmatch(r"([\w.-]+/[\w.-]+)/(\.github/workflows/[\w.-]+\.ya?ml)@[\w./-]+", ref)
+          if not m or not re.fullmatch(r"[0-9a-f]{40}", sha):
+              raise SystemExit(f"unexpected workflow identity: {ref} {sha}")
+          print(f"repo={m[1]}")
+          print(f"workflow={m[1]}/{m[2]}")
+          print(f"sha={sha}")
+          EOF
+
+  fetch:
+    # Builds or downloads the drop and nothing else. Never runs the box.
+    needs: tools
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    outputs:
+      sha256: ${{ steps.get.outputs.sha256 }}
+      url: ${{ steps.get.outputs.url }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: src
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ needs.tools.outputs.repo }}
+          ref: ${{ needs.tools.outputs.sha }}
+          path: rb
+          persist-credentials: false
+      - name: Get the drop
+        id: get
+        env:
+          BOX: ${{ inputs.box }}
+          DROP_URL: ${{ inputs.drop_url }}
+          DROP_SHA256: ${{ inputs.drop_sha256 }}
+          TREE: ${{ github.server_url }}/${{ github.repository }}/tree/${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/in"
+          if [ -n "$DROP_URL" ]; then
+            [ -n "$DROP_SHA256" ] || { echo "drop_url needs drop_sha256"; exit 2; }
+            case "$DROP_URL" in https://*) ;; *) echo "drop_url must start with https://"; exit 2;; esac
+            curl --fail --location --proto '=https' --max-filesize 52428800 --max-time 120 \
+              --output "$RUNNER_TEMP/in/drop.tar.gz" -- "$DROP_URL"
+            echo "$DROP_SHA256  $RUNNER_TEMP/in/drop.tar.gz" | sha256sum --check --strict
+            url="$DROP_URL"
+          else
+            [ -n "$BOX" ] || { echo "give either box or drop_url"; exit 2; }
+            case "$BOX" in /*|*..*) echo "box must be a path inside this repository"; exit 2;; esac
+            [ -f "src/$BOX/box.json" ] || { echo "no box.json in $BOX"; exit 2; }
+            name="${GITHUB_REPOSITORY#*/}"
+            [ "$BOX" = "." ] || name="$(basename "$BOX")"
+            python3 rb/research-box/scripts/build_box.py "src/$BOX" --for shareable \
+              --out "$RUNNER_TEMP/build/$name"
+            tar -C "$RUNNER_TEMP/build" -czf "$RUNNER_TEMP/in/drop.tar.gz" "$name"
+            url="$TREE/$BOX"
+          fi
+          echo "sha256=$(sha256sum "$RUNNER_TEMP/in/drop.tar.gz" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rerun-drop
+          path: ${{ runner.temp }}/in/drop.tar.gz
+          retention-days: 7
+
+  rerun:
+    # Runs the box's own code three times, with no network and no credentials.
+    needs: [tools, fetch]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ needs.tools.outputs.repo }}
+          ref: ${{ needs.tools.outputs.sha }}
+          path: rb
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: rerun-drop
+          path: ${{ runner.temp }}/in
+      - name: Unpack
+        run: python3 rb/.github/rerun/unpack.py "$RUNNER_TEMP/in/drop.tar.gz" "$RUNNER_TEMP/drop"
+      - name: Allow user namespaces, so the runs can have no network
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Three runs, no network
+        run: |
+          mkdir -p "$RUNNER_TEMP/runs"
+          # Each run gets the box's own timeout, capped at 5 minutes.
+          cap=$(python3 -I -c 'import json,sys
+          try: t=float(json.load(open(sys.argv[1]))["reproduce"].get("timeout_seconds", 300))
+          except Exception: t=300
+          print(min(t, 300) if t > 0 else 300)' "$RUNNER_TEMP/drop/box.json")
+          for i in 1 2 3; do
+            python3 rb/research-box/scripts/build_box.py "$RUNNER_TEMP/drop" --reproduce --yes \
+              --no-network --timeout "$cap" --report "$RUNNER_TEMP/runs/run-$i.json" || echo "run $i exit $?"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rerun-runs
+          path: ${{ runner.temp }}/runs/run-*.json
+          retention-days: 7
+
+  attest:
+    # Checks the run reports against the drop and signs. Never runs the box.
+    needs: [tools, fetch, rerun]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    timeout-minutes: 10
+    outputs:
+      verdict: ${{ steps.assemble.outputs.verdict }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ needs.tools.outputs.repo }}
+          ref: ${{ needs.tools.outputs.sha }}
+          path: rb
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: rerun-drop
+          path: ${{ runner.temp }}/in
+      - uses: actions/download-artifact@v4
+        with:
+          name: rerun-runs
+          path: ${{ runner.temp }}/runs
+      - name: Check the drop is the one fetched
+        env:
+          SHA: ${{ needs.fetch.outputs.sha256 }}
+        run: echo "$SHA  $RUNNER_TEMP/in/drop.tar.gz" | sha256sum --check --strict
+      - name: Assemble the report
+        id: assemble
+        env:
+          SOURCE_URL: ${{ needs.fetch.outputs.url }}
+          SOURCE_SHA: ${{ needs.fetch.outputs.sha256 }}
+          SUBMITTER: ${{ inputs.submitter }}
+          SIGNER: ${{ needs.tools.outputs.workflow }}
+          TOOLS_SHA: ${{ needs.tools.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 rb/.github/rerun/unpack.py "$RUNNER_TEMP/in/drop.tar.gz" "$RUNNER_TEMP/drop"
+          python3 rb/.github/rerun/assemble.py --drop "$RUNNER_TEMP/drop" --runs "$RUNNER_TEMP/runs" \
+            --out "$RUNNER_TEMP/out" --repository "$GITHUB_REPOSITORY" \
+            --signer-workflow "$SIGNER" --workflow-run "$RUN_URL" --workflow-sha "$TOOLS_SHA" \
+            --runner-image "$ImageOS $ImageVersion" --source-url "$SOURCE_URL" \
+            --source-sha256 "$SOURCE_SHA" --submitter "$SUBMITTER"
+          verdict=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["verdict"])' \
+            "$RUNNER_TEMP/out/report.json")
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+      - name: Sign the report (keyless, Sigstore)
+        id: sign
+        if: inputs.sign
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ runner.temp }}/out/report.json
+      - name: Summary
+        env:
+          BUNDLE: ${{ steps.sign.outputs.bundle-path }}
+          SIGNER: ${{ needs.tools.outputs.workflow }}
+          VERDICT: ${{ steps.assemble.outputs.verdict }}
+          SIGNED: ${{ inputs.sign }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BUNDLE" ] && [ -f "$BUNDLE" ]; then cp "$BUNDLE" "$RUNNER_TEMP/out/report.sigstore.json"; fi
+          {
+            echo "### research-box rerun: $VERDICT"
+            echo
+            if [ "$SIGNED" = true ]; then
+              echo 'Download the `rerun-report` artifact, then check it with:'
+              echo
+              echo '```'
+              echo "gh attestation verify report.json --repo $GITHUB_REPOSITORY \\"
+              echo "  --signer-workflow $SIGNER"
+              echo '```'
+            else
+              echo "Test run: nothing was signed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rerun-report
+          path: ${{ runner.temp }}/out/
+          retention-days: 90

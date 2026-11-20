@@ -790,7 +790,8 @@ def verify_report(folder, args):
         return status
 
     if attested:
-        status, identity = check_attestation(report, attested, args.bundle)
+        status, identity = check_attestation(report, attested, args.bundle,
+                                              getattr(args, "signer_workflow", None))
         if status != 0:
             return status
         logged = "an entry in the Sigstore public transparency log"
@@ -826,10 +827,11 @@ def verify_report(folder, args):
     return finish_verify(folder, data, raw, identity, None, args, signature)
 
 
-def check_attestation(report, repo, bundle):
-    """Check with the GitHub CLI that the rerun workflow of REPO attested to this exact
-    report file. Returns (status, identity)."""
-    workflow = f"{repo}/{RERUN_WORKFLOW}"
+def check_attestation(report, repo, bundle, signer_workflow=None):
+    """Check with the GitHub CLI that the rerun workflow of REPO (or SIGNER_WORKFLOW, for a
+    rerun run in someone's own repository) attested to this exact report file. Returns
+    (status, identity)."""
+    workflow = signer_workflow or f"{repo}/{RERUN_WORKFLOW}"
     exe = shutil.which("gh")
     if exe is None:
         print("The GitHub CLI (gh) is needed to check a GitHub attestation and was not "
@@ -955,6 +957,10 @@ def parse(argv):
                    help="with --verify-report: instead of an SSH signature, check with the "
                         "GitHub CLI that this repository's rerun workflow attested to the "
                         "report (a GitHub Actions rerun)")
+    p.add_argument("--signer-workflow", metavar="OWNER/REPO/.github/workflows/FILE",
+                   help="with --attested-by: the workflow expected to have signed, for a "
+                        "rerun run in your own repository (default: REPO's rerun.yml), "
+                        "for example PaoloTCS/research-box/.github/workflows/rerun-own.yml")
     p.add_argument("--bundle", type=Path, metavar="FILE",
                    help="with --attested-by: the attestation bundle on disk (default: "
                         "fetch it from GitHub)")
@@ -968,6 +974,11 @@ def parse(argv):
         p.error("--log-proof and --log-signers go together")
     if args.bundle is not None and args.attested_by is None:
         p.error("--bundle goes with --attested-by")
+    if args.signer_workflow is not None and args.attested_by is None:
+        p.error("--signer-workflow goes with --attested-by")
+    if args.signer_workflow is not None and not re.fullmatch(
+            r"[\w.-]+/[\w.-]+/\.github/workflows/[\w.-]+\.ya?ml", args.signer_workflow):
+        p.error("--signer-workflow takes OWNER/REPO/.github/workflows/FILE.yml")
     if args.attested_by is not None and args.verify_report is None:
         p.error("--attested-by goes with --verify-report")
     if args.attested_by is not None and any(v is not None for v in verify_only):

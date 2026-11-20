@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 RUNS = 3
+DEFAULT_WORKFLOW = ".github/workflows/rerun.yml"
 HERE = Path(__file__).resolve().parent
 TOOL = HERE.parent.parent / "research-box" / "scripts" / "build_box.py"
 
@@ -82,6 +83,9 @@ def stored(bb, drop, runs):
 
 def page(report, source):
     r = report["runner"]
+    signer = r.get("signer_workflow") or f"{r['repository']}/{DEFAULT_WORKFLOW}"
+    flag = ("" if signer == f"{r['repository']}/{DEFAULT_WORKFLOW}"
+            else f" \\\n  --signer-workflow {html.escape(signer)}")
     rows = "".join(
         f"<tr><td>{html.escape(str(e.get('output')))}</td>"
         f"<td>{html.escape(str(e.get('expected')))}</td>"
@@ -107,10 +111,10 @@ runner image {html.escape(str(r.get('runner_image')))}<br>
 workflow run <a href="{html.escape(r['workflow_run'])}">{html.escape(r['workflow_run'])}</a> at commit {html.escape(r['workflow_sha'])}<br>
 drop file {html.escape(source['url'])} (sha256 {html.escape(source['sha256'])})</p>
 <h2>Check it yourself</h2><pre>gh attestation verify report.json --repo {html.escape(r['repository'])} \\
-  --signer-workflow {html.escape(r['repository'])}/.github/workflows/rerun.yml
-python3 build_box.py DROP --verify-report report.json --attested-by {html.escape(r['repository'])}</pre>
-<p>The signature is GitHub's keyless signing through Sigstore, tied to this repository's
-rerun workflow, and recorded in Sigstore's public transparency log. It shows which workflow
+  --signer-workflow {html.escape(signer)}
+python3 build_box.py DROP --verify-report report.json --attested-by {html.escape(r['repository'])}{flag}</pre>
+<p>The signature is GitHub's keyless signing through Sigstore, tied to the research-box
+rerun workflow {html.escape(signer)}, and recorded in Sigstore's public transparency log. It shows which workflow
 produced the report, not that the result is correct.</p>
 <p><small>research-box is built with Claude, by Anthropic. Anthropic does not run or endorse
 these reruns.</small></p>
@@ -123,6 +127,9 @@ def main(argv):
     p.add_argument("--runs", type=Path, required=True, help="folder with run-1.json ...")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--repository", required=True)
+    p.add_argument("--signer-workflow", default="",
+                   help="OWNER/REPO/.github/workflows/FILE that signs (default: rerun.yml of "
+                        "--repository)")
     p.add_argument("--workflow-run", required=True)
     p.add_argument("--workflow-sha", required=True)
     p.add_argument("--runner-image", default="")
@@ -170,6 +177,8 @@ def main(argv):
     report["runner"] = {
         "runner": "GitHub Actions, research-box rerun workflow (beta)",
         "repository": args.repository,
+        "signer_workflow": args.signer_workflow
+        or f"{args.repository}/{DEFAULT_WORKFLOW}",
         "workflow_run": args.workflow_run,
         "workflow_sha": args.workflow_sha,
         "runner_image": args.runner_image or None,

@@ -48,11 +48,30 @@ class RerunTests(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def assemble(self, runs, out):
+    def assemble(self, runs, out, *extra):
         return run(ASSEMBLE, "--drop", self.drop, "--runs", runs, "--out", out,
                    "--repository", "owner/repo", "--workflow-run", "https://example.org/run",
                    "--workflow-sha", "abc", "--source-url", "https://example.org/d.tar.gz",
-                   "--source-sha256", "0" * 64)
+                   "--source-sha256", "0" * 64, *extra)
+
+    def test_signer_workflow_defaults_to_the_repositorys_rerun(self):
+        out = self.tmp / "out-default-signer"
+        self.assertEqual(self.assemble(self.runs, out).returncode, 0)
+        report = json.loads((out / "report.json").read_text())
+        self.assertEqual(report["runner"]["signer_workflow"],
+                         "owner/repo/.github/workflows/rerun.yml")
+
+    def test_rerun_in_your_own_repository_names_the_shared_workflow(self):
+        out = self.tmp / "out-own-repo"
+        signer = "PaoloTCS/research-box/.github/workflows/rerun-own.yml"
+        result = self.assemble(self.runs, out, "--signer-workflow", signer)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        report = json.loads((out / "report.json").read_text())
+        self.assertEqual(report["runner"]["repository"], "owner/repo")
+        self.assertEqual(report["runner"]["signer_workflow"], signer)
+        page = (out / "certificate.html").read_text()
+        self.assertIn(f"--signer-workflow {signer}", page)
+        self.assertIn("--attested-by owner/repo \\\n  --signer-workflow", page)
 
     def tampered(self, change):
         runs = Path(tempfile.mkdtemp(dir=self.tmp))
@@ -179,6 +198,22 @@ class AttestedVerifyTests(unittest.TestCase):
                      "--attested-by", "owner/repo", env=env)
         self.assertEqual(result.returncode, 1)
         self.assertIn("Not verified", result.stdout)
+
+    def test_signer_workflow_is_passed_to_gh(self):
+        env = self.stand_in(0)
+        signer = "PaoloTCS/research-box/.github/workflows/rerun-own.yml"
+        result = run(SCRIPT, self.drop, "--verify-report", self.report,
+                     "--attested-by", "owner/repo", "--signer-workflow", signer, env=env)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        args = (self.tmp / "gh-args").read_text()
+        self.assertIn("--repo owner/repo", args)
+        self.assertIn(f"--signer-workflow {signer}", args)
+
+    def test_signer_workflow_must_be_a_workflow_path(self):
+        result = run(SCRIPT, self.drop, "--verify-report", self.report,
+                     "--attested-by", "owner/repo", "--signer-workflow", "owner/repo")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--signer-workflow takes", result.stderr)
 
     def test_attested_by_does_not_mix_with_ssh_options(self):
         result = run(SCRIPT, self.drop, "--verify-report", self.report,

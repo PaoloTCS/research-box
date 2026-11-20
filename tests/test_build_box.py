@@ -636,6 +636,204 @@ class VerifyReportTests(unittest.TestCase):
         self.assertEqual(self.verify().returncode, 0)
         self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), before)
 
+    # A trusted key can sign a report that contradicts itself. The signature only says who
+    # vouches; the verdict must also follow from the report's own observed values.
+
+    def signed_after(self, change):
+        data = json.loads(self.report.read_text())
+        change(data)
+        self.report.write_text(json.dumps(data, indent=2) + "\n")
+        self.sign(self.alice)
+        return self.verify()
+
+    def fresh_report(self):
+        """Write an honest report again (subtests change it in place)."""
+        r = run(self.out, "--reproduce", "--yes", "--report", self.report)
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def assertNotVerified(self, r, words):
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("Signature: good", r.stdout)
+        self.assertIn("Result: not verified.", r.stdout)
+        self.assertNotIn("Result: verified.", r.stdout)
+        self.assertIn(words, r.stdout)
+
+    def test_honest_report_is_rechecked_and_verifies(self):
+        self.sign(self.alice)
+        r = self.verify()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("match   stdout (text): expected [487, 267]; observed [487, 267]",
+                      r.stdout)
+
+    def test_tampered_observed_value_fails(self):
+        r = self.signed_after(lambda d: d["expectations"][0].update(observed="[1, 2]"))
+        self.assertNotVerified(r, "the report says match, but observed '[1, 2]'")
+        self.assertIn("DIFFERS  stdout (text)", r.stdout)
+
+    def test_tampered_matched_flag_fails(self):
+        r = self.signed_after(lambda d: d["expectations"][0].update(matched=False))
+        self.assertNotVerified(r, "the report says differs")
+
+    def test_reproduced_verdict_over_a_differing_row_fails(self):
+        # Every row is honest and says differs; only the verdict claims reproduced.
+        r = self.signed_after(lambda d: d["expectations"][0].update(observed="[1, 2]",
+                                                                    matched=False))
+        self.assertNotVerified(r, "an output differs from what the drop expects")
+
+    def test_missing_expectations_fail(self):
+        for words, change in [
+            ("lists no expectations", lambda d: d.pop("expectations")),
+            ("lists no expectations", lambda d: d.update(expectations=[])),
+            ("incomplete row", lambda d: d["expectations"][0].pop("observed")),
+        ]:
+            with self.subTest(words):
+                self.fresh_report()
+                self.assertNotVerified(self.signed_after(change), words)
+
+    def test_rows_must_be_the_drops_own(self):
+        for words, change in [
+            ("is not what the drop declares",
+             lambda d: d["expectations"][0].update(expected="[1, 2]", observed="[1, 2]")),
+            ("that the drop does not declare",
+             lambda d: d["expectations"].append(dict(d["expectations"][0]))),
+            ("another command", lambda d: d.update(command=["python3", "other.py"])),
+        ]:
+            with self.subTest(words):
+                self.fresh_report()
+                self.assertNotVerified(self.signed_after(change), words)
+
+    def test_failed_or_missing_exit_code_fails(self):
+        for words, change in [
+            ("exited with status 1", lambda d: d.update(exit_code=1)),
+            ("records no exit code", lambda d: d.pop("exit_code")),
+        ]:
+            with self.subTest(words):
+                self.fresh_report()
+                self.assertNotVerified(self.signed_after(change), words)
+
+    def test_rerun_report_with_a_failed_run_fails(self):
+        r = self.signed_after(lambda d: d.update(runner={
+            "verdicts": ["reproduced", "did not reproduce", "reproduced"]}))
+        self.assertNotVerified(r, "not every rerun reproduced")
+
+
+@unittest.skipUnless(SSH_KEYGEN, "ssh-keygen (OpenSSH 8.2 or later) is not installed")
+class VerifyReportValuesTests(unittest.TestCase):
+    """Named numbers: the verifier applies the same tolerances as --reproduce."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.saved_tmpdir = os.environ.get("TMPDIR")
+        os.environ["TMPDIR"] = str(self.tmp)
+        self.out = self.tmp / "drop"
+        r = run(ROOT / "examples" / "harmonic-numbers", "--for", "shareable", "--out", self.out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.report = self.tmp / "report.json"
+        r = run(self.out, "--reproduce", "--yes", "--report", self.report)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.honest = self.report.read_text()
+        self.key = self.tmp / "key"
+        subprocess.run([SSH_KEYGEN, "-q", "-t", "ed25519", "-N", "", "-C", "k",
+                        "-f", str(self.key)], check=True)
+        public = Path(str(self.key) + ".pub").read_text().split()[:2]
+        self.signers = self.tmp / "allowed_signers"
+        self.signers.write_text(f'k@example.org namespaces="research-box-report" '
+                                f'{" ".join(public)}\n')
+
+    def tearDown(self):
+        if self.saved_tmpdir is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = self.saved_tmpdir
+        shutil.rmtree(self.tmp)
+
+    def verify_with(self, key, observed):
+        data = json.loads(self.honest)
+        row = next(e for e in data["expectations"] if e["output"].endswith(f" {key}"))
+        row["observed"] = observed
+        self.report.write_text(json.dumps(data, indent=2) + "\n")
+        sig = Path(str(self.report) + ".sig")
+        if sig.exists():
+            sig.unlink()
+        subprocess.run([SSH_KEYGEN, "-q", "-Y", "sign", "-f", str(self.key), "-n",
+                        "research-box-report", str(self.report)], check=True,
+                       capture_output=True)
+        return run(self.out, "--verify-report", self.report, "--allowed-signers", self.signers)
+
+    def test_honest_values_verify(self):
+        data = json.loads(self.honest)
+        self.assertEqual(len(data["expectations"]), 4)
+        H = next(e for e in data["expectations"] if e["output"].endswith(" H"))["observed"]
+        r = self.verify_with("H", H)
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_value_within_tolerance_still_verifies(self):
+        r = self.verify_with("H", 14.392726722865724 * (1 + 5e-13))  # rel 1e-12 allowed
+        self.assertEqual(r.returncode, 0, r.stdout)
+
+    def test_value_outside_tolerance_fails(self):
+        for key, observed in [("H", 14.4), ("first_n_over_10", 12368),
+                              ("H", "14.392726722865724"), ("H", None), ("H", True)]:
+            with self.subTest(observed):
+                r = self.verify_with(key, observed)
+                self.assertEqual(r.returncode, 1, r.stdout)
+                self.assertIn("Result: not verified.", r.stdout)
+                self.assertIn("the report says match", r.stdout)
+
+
+class RecheckExpectationsTests(unittest.TestCase):
+    """The comparison worked out again, without signing or running anything."""
+
+    def setUp(self):
+        self.bb = load_script()
+        self.block = {"expect": [
+            {"source": "out.json", "match": "values",
+             "values": [{"key": "x", "equals": 2.0, "abs": 0.1}, {"key": "n", "at_most": 9}]},
+            {"source": "stdout", "match": "sha256", "value": "a" * 64}]}
+
+    def rows(self, x=2.05, n=7, h="a" * 64):
+        return [{"output": "out.json x", "expected": "= 2.0 within 0.1", "observed": x,
+                 "matched": True},
+                {"output": "out.json n", "expected": "<= 9", "observed": n, "matched": True},
+                {"output": "stdout (SHA-256)", "expected": "a" * 64, "observed": h,
+                 "matched": True}]
+
+    def test_rows_written_by_compare_recheck_clean(self):
+        rows = [{"output": o, "expected": e, "observed": g, "matched": m}
+                for spec in self.block["expect"]
+                for o, e, g, m in self.bb.compare(
+                    spec, b'{"x": 2.05, "n": 7}' if spec["match"] == "values" else b"hi")]
+        checked, problems = self.bb.recheck_expectations(self.block, rows)
+        self.assertEqual(problems, [])
+        self.assertEqual([c[3] for c in checked], [True, True, False])
+
+    def test_honest_rows_pass(self):
+        self.assertEqual(self.bb.recheck_expectations(self.block, self.rows())[1], [])
+
+    def test_each_tampered_value_is_caught(self):
+        for rows in (self.rows(x=2.2), self.rows(n=10), self.rows(h="b" * 64),
+                     self.rows(x="missing"), self.rows(n=False)):
+            with self.subTest(rows):
+                problems = self.bb.recheck_expectations(self.block, rows)[1]
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("the report says match", problems[0])
+
+    def test_missing_output_row_must_say_differs(self):
+        rows = [{"output": "out.json",
+                 "expected": self.bb.describe_expect(self.block["expect"][0]),
+                 "observed": "missing", "matched": True},
+                self.rows()[2]]
+        self.assertEqual(len(self.bb.recheck_expectations(self.block, rows)[1]), 1)
+        rows[0]["matched"] = False
+        checked, problems = self.bb.recheck_expectations(self.block, rows)
+        self.assertEqual(problems, [])
+        self.assertFalse(checked[0][3])
+
+    def test_short_or_malformed_rows_fail(self):
+        for rows in (None, [], "rows", self.rows()[:2], [None] + self.rows()[1:]):
+            with self.subTest(rows):
+                self.assertTrue(self.bb.recheck_expectations(self.block, rows)[1])
+
 
 def write_zip(path, members):
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:

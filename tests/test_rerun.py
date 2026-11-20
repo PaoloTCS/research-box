@@ -102,6 +102,8 @@ class RerunTests(unittest.TestCase):
             "names another command": lambda d: d.update(command=["python3", "other.py"]),
             "other expectations": lambda d: d["expectations"][0].update(expected="[1, 2]"),
             "did not match": lambda d: d["expectations"][0].update(matched=False),
+            "own values do not support it":
+                lambda d: d["expectations"][0].update(observed="[1, 2]"),
             "another claim": lambda d: d.update(claim="It is all true."),
         }
         for words, change in cases.items():

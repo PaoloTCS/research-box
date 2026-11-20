@@ -44,7 +44,10 @@ Reads <box-folder>/box.json (format in references/box-format.md). Standard libra
           research-box-report REPORT, which writes REPORT.sig). Runs nothing from the box.
           It checks the drop against its manifests, the signature against an OpenSSH
           allowed_signers file (--allowed-signers) using the local ssh-keygen, that the
-          report names this drop (drop_id), and that its verdict is reproduced. Exit status:
+          report names this drop (drop_id), and that its verdict is reproduced. It then works
+          the comparison out again from the drop's own expectations and the report's observed
+          values (same tolerances as --reproduce) and fails a report whose rows, exit code or
+          verdict disagree with that. Exit status:
           0 verified, 1 a signature, drop, file or verdict does not match, 2 could not check
           (no manifests, unreadable report, no signature file, or no ssh-keygen).
 
@@ -405,16 +408,128 @@ def compare(e, raw):
         if isinstance(got, bool) or not isinstance(got, (int, float)):
             rows.append((name, value_rule(v), repr(got), False))
             continue
-        ok = True
-        if "equals" in v:
-            allowed = max(v.get("abs", 0), v.get("rel", 0) * abs(v["equals"]))
-            ok = abs(got - v["equals"]) <= allowed
-        if "at_least" in v:
-            ok = ok and got >= v["at_least"]
-        if "at_most" in v:
-            ok = ok and got <= v["at_most"]
-        rows.append((name, value_rule(v), got, ok))
+        rows.append((name, value_rule(v), got, value_ok(v, got)))
     return rows
+
+
+def value_ok(v, got):
+    """Whether a number meets one named number's rule (equals within abs or rel, at_least,
+    at_most). Anything that is not a number does not."""
+    if isinstance(got, bool) or not isinstance(got, (int, float)):
+        return False
+    ok = True
+    if "equals" in v:
+        allowed = max(v.get("abs", 0), v.get("rel", 0) * abs(v["equals"]))
+        ok = abs(got - v["equals"]) <= allowed
+    if "at_least" in v:
+        ok = ok and got >= v["at_least"]
+    if "at_most" in v:
+        ok = ok and got <= v["at_most"]
+    return ok
+
+
+def recheck_expectations(block, rows):
+    """Work out again, from the drop's own declared expectations (block["expect"]) and the
+    observed values a report records, whether each output matched. Rows are the report's
+    "expectations" list. Returns (checked, problems): checked is a list of (label,
+    expected, observed, matched) as worked out here; problems lists every way the report's
+    rows disagree with the drop or with themselves. An empty problems list means the rows
+    are exactly what --reproduce writes for those observed values."""
+    if not isinstance(rows, list) or not rows:
+        return [], ["the report lists no expectations"]
+    checked, problems = [], []
+
+    def take(i):
+        row = rows[i] if i < len(rows) else None
+        if not isinstance(row, dict) or not all(k in row for k in
+                                                ("output", "expected", "observed", "matched")):
+            return None
+        return row
+
+    def judge(row, label, expected, matched):
+        observed = row["observed"]
+        checked.append((label, expected, observed, matched))
+        if row["output"] != label or row["expected"] != expected:
+            problems.append(f"the row {row['output']!r} (expected {row['expected']!r}) is not "
+                            f"what the drop declares ({label!r}, expected {expected!r})")
+        elif row["matched"] is not matched:
+            problems.append(f"{label}: the report says "
+                            f"{'match' if row['matched'] else 'differs'}, but observed "
+                            f"{observed!r} against expected {expected!r} "
+                            f"{'matches' if matched else 'differs'}")
+
+    i = 0
+    for e in block["expect"]:
+        src = e["source"]
+        row = take(i)
+        if row is None:
+            problems.append(f"no row (or an incomplete row) for {describe_expect(e)}")
+            return checked, problems
+        # A run with no such output, or values output that is not JSON, writes one row.
+        if row["output"] == src and row["observed"] == "missing":
+            judge(row, src, describe_expect(e), False)
+            i += 1
+            continue
+        if e["match"] == "values" and row["output"] == f"{src} (values)" \
+                and row["observed"] == "not JSON":
+            judge(row, f"{src} (values)", describe_expect(e), False)
+            i += 1
+            continue
+        if e["match"] == "sha256":
+            judge(row, f"{src} (SHA-256)", e["value"], row["observed"] == e["value"])
+            i += 1
+        elif e["match"] == "text":
+            got = row["observed"]
+            ok = isinstance(got, str) and \
+                normal_text(got.encode("utf-8")) == normal_text(e["value"].encode("utf-8"))
+            judge(row, f"{src} (text)", e["value"], ok)
+            i += 1
+        else:
+            for v in e["values"]:
+                row = take(i)
+                if row is None:
+                    problems.append(f"no row (or an incomplete row) for {src} {v['key']}")
+                    return checked, problems
+                judge(row, f"{src} {v['key']}", value_rule(v), value_ok(v, row["observed"]))
+                i += 1
+    if i < len(rows):
+        problems.append(f"{len(rows) - i} row(s) that the drop does not declare")
+    return checked, problems
+
+
+def recheck_report(folder, data):
+    """Everything in a report's own contents that contradicts a "reproduced" verdict, worked
+    out from the drop's declared expectations. Returns (checked rows, problems)."""
+    folder = Path(folder)
+    problems = []
+
+    def stop(message):
+        raise SystemExit(message)
+
+    try:
+        box = json.loads((folder / "box.json").read_text(encoding="utf-8"))
+        block = read_reproduce(folder, box, stop)
+    except (OSError, ValueError, SystemExit) as err:
+        return [], [f"the drop's reproduce block cannot be read ({err})"]
+    if block is None:
+        return [], ["the drop declares no reproduce command"]
+    if data.get("command") != block["command"]:
+        problems.append("the report names another command than the drop declares")
+    if "exit_code" not in data:
+        problems.append("the report records no exit code")
+    elif data["exit_code"] != 0 or isinstance(data["exit_code"], bool):
+        problems.append(f"the command exited with status {data['exit_code']!r}")
+    checked, found = recheck_expectations(block, data.get("expectations"))
+    problems += found
+    if not problems and not all(r[3] for r in checked):
+        problems.append("an output differs from what the drop expects")
+    runner = data.get("runner")
+    if isinstance(runner, dict) and "verdicts" in runner:
+        verdicts = runner.get("verdicts")
+        if not isinstance(verdicts, list) or not verdicts or \
+                any(v != "reproduced" for v in verdicts):
+            problems.append(f"not every rerun reproduced ({verdicts!r})")
+    return checked, problems
 
 
 def number_forms(value):
@@ -646,7 +761,8 @@ def reproduce(folder, args):
 # an SSH key (ssh-keygen -Y sign -n research-box-report). --verify-report checks, without
 # running anything, that the signature verifies against an allowed-signers file, that the
 # report is about this exact drop, that the drop still matches its manifests, and that the
-# report says the result reproduced.
+# report says the result reproduced, and that the report's own observed values, compared
+# again with the drop's declared expectations, support that verdict.
 
 REPORT_NAMESPACE = "research-box-report"
 RERUN_WORKFLOW = ".github/workflows/rerun.yml"
@@ -885,16 +1001,24 @@ def finish_verify(folder, data, raw, identity, logged, args, signature):
             print(f"Note: {s.get('output')} = {s.get('value')} already appears in "
                   f"{', '.join(map(str, s.get('files') or []))}; check that it is computed.")
 
-    for e in data.get("expectations") or []:
-        if isinstance(e, dict):
-            mark = "match " if e.get("matched") else "DIFFERS"
-            print(f"  {mark}  {e.get('output')}: expected {e.get('expected')}; "
-                  f"observed {e.get('observed')}")
+    # The signature vouches for who wrote the report, not that it is consistent: work the
+    # comparison out again from the drop's own expectations and the observed values.
+    checked, problems = recheck_report(folder, data)
+    for label, expected, observed, matched in checked:
+        print(f"  {'match ' if matched else 'DIFFERS'}  {label}: expected {expected}; "
+              f"observed {observed}")
     when = data.get("started", "an unrecorded time")
     where = data.get("platform", "an unrecorded platform")
     if data["verdict"] != "reproduced":
         print(f"Result: the signed report says this drop did not reproduce "
               f"({data['verdict']}), run {when} on {where}.")
+        return 1
+    if problems:
+        print("The report says reproduced, but its own contents say otherwise:")
+        for p in problems:
+            print(f"  - {p}")
+        print("Result: not verified. The comparison, worked out again from the drop's "
+              "expectations and the report's observed values, does not support the verdict.")
         return 1
     print(f"Result: verified. {identity} signed a report that this drop reproduced, run "
           f"{when} on {where}" + (f", logged as {logged}" if logged else "") + ". A "

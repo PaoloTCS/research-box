@@ -41,7 +41,10 @@ def declared(bb, drop):
     block = bb.read_reproduce(drop, box, stop)
     if block is None:
         raise SystemExit("the drop declares no reproduce command")
-    rows = [(r[0], r[1]) for e in block["expect"] for r in bb.compare(e, b"")]
+    # Compare against empty output: every row then carries the drop's own label and rule.
+    # Named-number checks need an empty JSON object, or they collapse into one "not JSON" row.
+    rows = [(r[0], r[1]) for e in block["expect"]
+            for r in bb.compare(e, b"{}" if e["match"] == "values" else b"")]
     return block["command"], rows
 
 

@@ -1,0 +1,40 @@
+name: Rerun request
+description: Ask for a free signed rerun of a research-box drop on GitHub Actions (beta).
+title: "Rerun request"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A rerun runs your drop's declared command three times on GitHub's machines with no network, checks the outputs against what the drop declares, and, if they match, signs the report through Sigstore and publishes a certificate page.
+
+        Make the drop with `build_box.py BOX --for shareable --out FOLDER`, pack it with `tar -czf drop.tar.gz -C PARENT FOLDER`, put the archive at a public https address (a GitHub release asset works), and give its sha256 below.
+
+        Limits in this beta: archives up to 50 MB (500 MB unpacked), each run up to 5 minutes, standard library Python only (nothing is installed), 3 requests per person per day, 20 per day in all. Everything you send and the report are public.
+  - type: input
+    id: drop_url
+    attributes:
+      label: Drop address
+      description: https address of the .tar.gz archive
+      placeholder: https://github.com/you/project/releases/download/v1/drop.tar.gz
+    validations:
+      required: true
+  - type: input
+    id: drop_sha256
+    attributes:
+      label: Archive sha256
+      description: as `sha256sum drop.tar.gz` prints it (64 hex digits)
+    validations:
+      required: true
+  - type: input
+    id: submitter
+    attributes:
+      label: Name or ORCID to show on the report (optional)
+    validations:
+      required: false
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Public
+      options:
+        - label: I understand the drop, the report and this issue are public, and that a certificate does not show the result is correct.
+          required: true

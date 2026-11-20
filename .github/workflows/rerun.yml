@@ -1,9 +1,9 @@
 name: rerun
 
 # Reruns a research-box drop three times on GitHub's machines with no network, and signs the
-# result with GitHub's keyless artifact attestation (Sigstore). Beta: a maintainer starts each
-# rerun by hand; with no drop_url it reruns the example box. On pull requests it reruns the
-# example box as a self-test and signs nothing.
+# result with GitHub's keyless artifact attestation (Sigstore). Started by a maintainer, or by
+# the rerun request workflow for a "Rerun request" issue; with no drop_url it reruns the example
+# box. On pull requests, and with dry_run, it reruns and checks but signs and publishes nothing.
 
 on:
   workflow_dispatch:
@@ -20,6 +20,15 @@ on:
         description: "who asked for the rerun (name or ORCID), shown on the report"
         required: false
         default: ""
+      issue_number:
+        description: "rerun request issue to answer when done (set by the rerun request workflow)"
+        required: false
+        default: ""
+      dry_run:
+        description: "test only: run and check, but sign and publish nothing"
+        type: boolean
+        required: false
+        default: false
   pull_request:
     paths:
       - ".github/workflows/rerun.yml"
@@ -78,7 +87,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
         with:
@@ -94,9 +103,14 @@ jobs:
       - name: Three runs, no network
         run: |
           mkdir -p "$RUNNER_TEMP/runs"
+          # Each run gets the box's own timeout, capped at 5 minutes.
+          cap=$(python3 -I -c 'import json,sys
+          try: t=float(json.load(open(sys.argv[1]))["reproduce"].get("timeout_seconds", 300))
+          except Exception: t=300
+          print(min(t, 300) if t > 0 else 300)' "$RUNNER_TEMP/drop/box.json")
           for i in 1 2 3; do
             python3 research-box/scripts/build_box.py "$RUNNER_TEMP/drop" --reproduce --yes \
-              --no-network --report "$RUNNER_TEMP/runs/run-$i.json" || echo "run $i exit $?"
+              --no-network --timeout "$cap" --report "$RUNNER_TEMP/runs/run-$i.json" || echo "run $i exit $?"
           done
       - uses: actions/upload-artifact@v4
         with:
@@ -141,12 +155,12 @@ jobs:
             --submitter "$SUBMITTER"
       - name: Sign the report (keyless, Sigstore)
         id: sign
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
         uses: actions/attest@v4
         with:
           subject-path: ${{ runner.temp }}/out/report.json
       - name: Publish to the certificates branch (served as the public site)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && !inputs.dry_run
         env:
           GH_TOKEN: ${{ github.token }}
           BUNDLE: ${{ steps.sign.outputs.bundle-path }}
@@ -173,3 +187,39 @@ jobs:
           name: report
           path: ${{ runner.temp }}/out/
           retention-days: 90
+
+  reply:
+    # Answers the rerun request issue, if there is one. Never runs the box.
+    needs: [fetch, rerun, attest]
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.issue_number != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: report
+          path: ${{ runner.temp }}/report
+      - name: Comment and close
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ inputs.issue_number }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SITE: ${{ vars.RERUN_SITE || 'https://reruns.thecornerstore.ai' }}
+        run: |
+          set -euo pipefail
+          case "$ISSUE" in ''|*[!0-9]*) echo "not an issue number"; exit 2;; esac
+          report="$RUNNER_TEMP/report/report.json"
+          if [ "${{ needs.attest.result }}" != success ]; then report=""; fi
+          python3 .github/rerun/reply.py --report "$report" --site "$SITE" \
+            --run-url "${{ github.server_url }}/$REPO/actions/runs/${{ github.run_id }}" \
+            --run-id "${{ github.run_id }}" --dry-run "$DRY_RUN" --out "$RUNNER_TEMP/reply.md"
+          gh issue comment "$ISSUE" --repo "$REPO" --body-file "$RUNNER_TEMP/reply.md"
+          gh issue close "$ISSUE" --repo "$REPO" --reason completed

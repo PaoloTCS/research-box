@@ -45,3 +45,28 @@ drop and that the drop still matches its manifests.
 That the outputs were computed rather than stored or fetched before the run, that the method
 is correct, or that the result holds on other machines. The box's own code produced what the
 run printed. The report lists any declared value that already appears in the box's files.
+
+
+## Requests from anyone (beta)
+
+Anyone can ask for a rerun by opening a "Rerun request" issue (the form is in
+`.github/ISSUE_TEMPLATE/rerun-request.yml`). The `rerun request` workflow reads the issue,
+checks it, and starts `rerun.yml`; when the rerun ends, `rerun.yml` comments on the issue with
+the verdict and the certificate link, and closes it. The request workflow never downloads or
+runs a drop.
+
+Limits, set in `request.py` and `rerun.yml`:
+
+- the drop address must be one plain https address, and the sha256 64 hex digits
+- the archive is at most 50 MB, and unpacks to at most 500 MB
+- each of the three runs gets the box's own timeout, capped at 5 minutes; the job stops at 20
+- 3 requests per GitHub account per 24 hours, and 20 reruns in all per 24 hours
+- the GitHub account must be at least 7 days old
+- nothing is installed: the box runs with the runner's Python and standard library
+
+Set the repository variable `RERUN_APPROVAL` to `maintainer` and each request waits until a
+maintainer adds the label `rerun-approved`. `RERUN_SITE` changes the address used in replies
+(default `https://reruns.thecornerstore.ai`).
+
+A maintainer can test a change without signing or publishing anything: start `rerun.yml` by
+hand with `dry_run` ticked.

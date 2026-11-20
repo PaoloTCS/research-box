@@ -1,0 +1,80 @@
+name: rerun request
+
+# Turns a "Rerun request" issue into a run of the rerun workflow. Reads the issue, checks the
+# address, the sha256 and the limits, and dispatches rerun.yml. Never downloads or runs a drop.
+# Set the repository variable RERUN_APPROVAL to "maintainer" to have each request wait until a
+# maintainer adds the label "rerun-approved"; by default ("auto") requests run at once.
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions: {}
+
+concurrency:
+  group: rerun-request-${{ github.event.issue.number }}
+
+jobs:
+  request:
+    if: contains(github.event.issue.body, '### Drop address')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+      actions: write
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Look up the requester and today's reruns
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          AUTHOR: ${{ github.event.issue.user.login }}
+          SENDER: ${{ github.event.sender.login }}
+        run: |
+          set -euo pipefail
+          since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          gh api -X GET "repos/$REPO/issues" -f creator="$AUTHOR" -f state=all -f since="$since" \
+            -f per_page=100 > "$RUNNER_TEMP/author-issues.json"
+          echo "AUTHOR_CREATED=$(gh api "users/$AUTHOR" --jq .created_at)" >> "$GITHUB_ENV"
+          echo "RUNS_TODAY=$(gh api -X GET "repos/$REPO/actions/workflows/rerun.yml/runs" \
+            -f event=workflow_dispatch -f created=">=$since" --jq .total_count)" >> "$GITHUB_ENV"
+          perm=$(gh api "repos/$REPO/collaborators/$SENDER/permission" --jq .permission 2>/dev/null || echo none)
+          echo "SENDER_PERMISSION=$perm" >> "$GITHUB_ENV"
+      - name: Decide
+        id: decide
+        env:
+          BODY: ${{ github.event.issue.body }}
+          ISSUE: ${{ github.event.issue.number }}
+          AUTHOR: ${{ github.event.issue.user.login }}
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL: ${{ github.event.label.name }}
+          APPROVAL: ${{ vars.RERUN_APPROVAL || 'auto' }}
+        run: python3 .github/rerun/request.py --author-issues "$RUNNER_TEMP/author-issues.json" --comment "$RUNNER_TEMP/comment.md"
+      - name: Start the rerun
+        if: steps.decide.outputs.action == 'run'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DROP_URL: ${{ steps.decide.outputs.drop_url }}
+          DROP_SHA256: ${{ steps.decide.outputs.drop_sha256 }}
+          SUBMITTER: ${{ steps.decide.outputs.submitter }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          gh workflow run rerun.yml --repo "$REPO" --ref "${{ github.event.repository.default_branch }}" \
+            -f drop_url="$DROP_URL" -f drop_sha256="$DROP_SHA256" -f submitter="$SUBMITTER" \
+            -f issue_number="$ISSUE"
+      - name: Answer the request
+        if: steps.decide.outputs.action != 'ignore'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+          ACTION: ${{ steps.decide.outputs.action }}
+        run: |
+          gh issue comment "$ISSUE" --repo "$REPO" --body-file "$RUNNER_TEMP/comment.md"
+          if [ "$ACTION" = refuse ]; then
+            gh issue close "$ISSUE" --repo "$REPO" --reason "not planned"
+          fi

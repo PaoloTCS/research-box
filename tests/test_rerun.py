@@ -189,3 +189,130 @@ class AttestedVerifyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+REQUEST = ROOT / ".github" / "rerun" / "request.py"
+REPLY = ROOT / ".github" / "rerun" / "reply.py"
+
+
+class NamedNumberRerunTests(unittest.TestCase):
+    """The second example box declares named numbers in a JSON file; the assembler must
+    accept its runs (it once read those checks as a single "not JSON" row)."""
+
+    def test_assembles_named_numbers(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            drop = tmp / "harmonic-numbers"
+            out = run(SCRIPT, ROOT / "examples" / "harmonic-numbers", "--for", "shareable",
+                      "--out", drop)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            runs = tmp / "runs"
+            runs.mkdir()
+            for i in (1, 2, 3):
+                path = runs / f"run-{i}.json"
+                out = run(SCRIPT, drop, "--reproduce", "--yes", "--report", path)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                data = json.loads(path.read_text())
+                data["network"] = "none (Linux network namespace)"
+                path.write_text(json.dumps(data))
+            out = run(ASSEMBLE, "--drop", drop, "--runs", runs, "--out", tmp / "out",
+                      "--repository", "owner/repo", "--workflow-run", "https://example.org/run",
+                      "--workflow-sha", "abc", "--source-url", "https://example.org/d.tar.gz",
+                      "--source-sha256", "0" * 64)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            report = json.loads((tmp / "out" / "report.json").read_text())
+            self.assertEqual(report["verdict"], "reproduced")
+            self.assertEqual(len(report["expectations"]), 4)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def form(url="https://example.org/drop.tar.gz", sha="a" * 64, name="_No response_"):
+    return (f"### Drop address\n\n{url}\n\n### Archive sha256\n\n{sha}\n\n"
+            f"### Name or ORCID to show on the report (optional)\n\n{name}\n\n"
+            f"### Public\n\n- [X] I understand\n")
+
+
+class RequestTests(unittest.TestCase):
+    def decide(self, body=None, issues=(), **env):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            (tmp / "issues.json").write_text(json.dumps(list(issues)))
+            base = {"BODY": form() if body is None else body, "ISSUE": "7", "AUTHOR": "alice",
+                    "EVENT_ACTION": "opened", "AUTHOR_CREATED": "2020-01-01T00:00:00Z",
+                    "RUNS_TODAY": "0", "PATH": os.environ.get("PATH", "")}
+            # Windows Python 3.10 cannot start without SYSTEMROOT (it seeds its hash from it).
+            base.update({k: os.environ[k] for k in ("SYSTEMROOT", "SystemRoot") if k in os.environ})
+            base.update(env)
+            out = run(REQUEST, "--author-issues", tmp / "issues.json",
+                      "--comment", tmp / "comment.md", env=base)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            return json.loads(out.stdout), (tmp / "comment.md").read_text()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_good_request_runs(self):
+        d, comment = self.decide()
+        self.assertEqual(d["action"], "run")
+        self.assertEqual(d["drop_sha256"], "a" * 64)
+        self.assertEqual(d["submitter"], "@alice")
+        self.assertIn("Rerun started", comment)
+
+    def test_other_issues_are_ignored(self):
+        self.assertEqual(self.decide(body="Just a bug report")[0]["action"], "ignore")
+
+    def test_bad_address_and_sha_are_refused(self):
+        for body in (form(url="http://example.org/x"), form(url="https://a.org/x\nhttps://b.org/y"),
+                     form(url="file:///etc/passwd"), form(sha="xyz"),
+                     form(url="https://example.org/$(id)")):
+            self.assertEqual(self.decide(body=body)[0]["action"], "refuse", body)
+
+    def test_new_accounts_and_limits_are_refused(self):
+        d, comment = self.decide(AUTHOR_CREATED="2099-01-01T00:00:00Z")
+        self.assertEqual(d["action"], "refuse")
+        recent = [{"number": n, "body": form(), "created_at": "2099-01-01T00:00:00Z"}
+                  for n in (1, 2, 3)]
+        self.assertEqual(self.decide(issues=recent)[0]["action"], "refuse")
+        self.assertEqual(self.decide(issues=recent[:2])[0]["action"], "run")
+        self.assertEqual(self.decide(RUNS_TODAY="20")[0]["action"], "refuse")
+
+    def test_maintainer_mode_waits_for_a_maintainers_label(self):
+        self.assertEqual(self.decide(APPROVAL="maintainer")[0]["action"], "wait")
+        labeled = dict(APPROVAL="maintainer", EVENT_ACTION="labeled", LABEL="rerun-approved")
+        self.assertEqual(self.decide(SENDER_PERMISSION="admin", **labeled)[0]["action"], "run")
+        self.assertEqual(self.decide(SENDER_PERMISSION="read", **labeled)[0]["action"], "ignore")
+        self.assertEqual(self.decide(EVENT_ACTION="labeled", LABEL="bug",
+                                     SENDER_PERMISSION="admin")[0]["action"], "ignore")
+
+    def test_submitter_text_is_kept_plain(self):
+        d, _ = self.decide(body=form(name="0000-0002-1825-0097"))
+        self.assertEqual(d["submitter"], "ORCID 0000-0002-1825-0097 (@alice)")
+        d, _ = self.decide(body=form(name="Ada Lovelace"))
+        self.assertEqual(d["submitter"], "Ada Lovelace (@alice)")
+        d, _ = self.decide(body=form(name="@everyone <script>"))
+        self.assertEqual(d["submitter"], "@alice")
+
+
+class ReplyTests(unittest.TestCase):
+    def reply(self, report, dry="false"):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            path = ""
+            if report is not None:
+                path = tmp / "report.json"
+                path.write_text(json.dumps(report))
+            out = run(REPLY, "--report", path, "--site", "https://site.example",
+                      "--run-url", "https://example.org/run", "--run-id", "42",
+                      "--dry-run", dry, "--out", tmp / "reply.md")
+            self.assertEqual(out.returncode, 0, out.stderr)
+            return (tmp / "reply.md").read_text()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_reply_links_the_certificate_and_keeps_box_text_out(self):
+        text = self.reply({"box": "@everyone", "verdict": "reproduced",
+                           "runner": {"verdicts": ["reproduced"] * 3}})
+        self.assertIn("https://site.example/r/42/certificate.html", text)
+        self.assertNotIn("@everyone", text)
+        self.assertIn("nothing was signed", self.reply({"verdict": "reproduced"}, dry="true"))
+        self.assertIn("did not produce a report", self.reply(None))

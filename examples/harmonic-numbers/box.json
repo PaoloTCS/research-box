@@ -1,0 +1,30 @@
+{
+  "box": "harmonic-numbers",
+  "title": "Harmonic numbers and the Euler-Mascheroni constant",
+  "description": "A short computation of H(n) for n = 1,000,000, its gap to ln(n) + gamma, and the first n with H(n) > 10.",
+  "created": "2026-11-20",
+  "dropped": "2026-11-20",
+  "author": "A. Researcher",
+  "default_sharing": "shareable",
+  "topics": ["harmonic numbers", "Euler-Mascheroni constant"],
+  "state": ["The gap matches 1/(2n) to five digits."],
+  "reproduce": {
+    "name": "Harmonic sums",
+    "command": ["python3", "code/harmonic.py"],
+    "requires": "Python 3, standard library only",
+    "timeout_seconds": 120,
+    "sharing": "shareable",
+    "expect": [
+      {"source": "out/results.json", "match": "values", "values": [
+        {"key": "H", "equals": 14.392726722865724, "rel": 1e-12},
+        {"key": "gap", "equals": 5e-7, "rel": 1e-5},
+        {"key": "first_n_over_10", "equals": 12367}
+      ]},
+      {"source": "stdout", "match": "text", "value": "H(1000000) = 14.392726722866"}
+    ]
+  },
+  "items": [
+    {"item": "Computation", "kind": "code", "live": null,
+     "snapshot": ["code/harmonic.py"], "sharing": "shareable"}
+  ]
+}

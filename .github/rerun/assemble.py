@@ -49,7 +49,7 @@ def declared(bb, drop):
     return block["command"], rows
 
 
-def problems_with(run, bb, drop_id, command, rows):
+def problems_with(run, bb, drop_id, command, rows, drop=None):
     found = []
     if run.get("drop_id") != drop_id:
         found.append("names another drop")
@@ -68,6 +68,13 @@ def problems_with(run, bb, drop_id, command, rows):
     if run.get("verdict") == "reproduced" and not all(
             e.get("matched") for e in run.get("expectations") or []):
         found.append("says reproduced with a value that did not match")
+    if drop is not None and run.get("verdict") == "reproduced":
+        # The same check --verify-report makes: work the comparison out again from the
+        # drop's expectations and the run's observed values, rather than trust its flags.
+        _, wrong = bb.recheck_report(drop, run)
+        if wrong:
+            found.append("says reproduced, but its own values do not support it ("
+                         + "; ".join(wrong) + ")")
     return found
 
 
@@ -158,7 +165,7 @@ def main(argv):
             print(f"Run {i} left no readable report ({err}). Nothing to sign.")
             return 1
     for i, run in enumerate(runs, 1):
-        found = problems_with(run, bb, drop_id, command, rows)
+        found = problems_with(run, bb, drop_id, command, rows, drop)
         if found:
             print(f"Run {i}'s report {'; '.join(found)}. Nothing to sign.")
             return 1

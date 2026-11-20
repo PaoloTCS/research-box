@@ -50,7 +50,7 @@ tests/test_build_box.py        unittest suite, standard library only
 
 ## Try it
 
-The commands and the output in [Quick demo](#quick-demo) were run against this revision. To run the 23-test suite:
+The commands and the output in [Quick demo](#quick-demo) were run against this revision. To run the 27-test suite:
 
 ```
 python3 -m unittest discover tests

@@ -18,7 +18,8 @@ does not control.
    (Sigstore), which records it in Sigstore's public transparency log, and publishes the
    report, the page and the signature bundle to the `certificates` branch.
 
-A maintainer starts each rerun by hand (Actions, rerun, Run workflow). On pull requests the
+A maintainer starts each rerun by hand (Actions, rerun, Run workflow). With no drop address
+it reruns the example box in `examples/prime-numbers`. On pull requests the
 workflow reruns the example box as a self-test and signs nothing.
 
 ## Checking a report

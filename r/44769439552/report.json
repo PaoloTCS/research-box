@@ -1,0 +1,55 @@
+{
+  "box": "prime-numbers",
+  "dropped": "2026-11-19",
+  "drop_id": "sha256:beb36bf193280a3888938795e497138a088a0b3c5264434f2b78acedf2c1164b",
+  "command": [
+    "python3",
+    "code/simulate.py"
+  ],
+  "platform": "Linux-7.0.0-1014-aws-x86_64-with-glibc2.39",
+  "python": "3.12.3",
+  "tool": "research-box 0.5.0",
+  "network": "none (Linux network namespace)",
+  "environment": [
+    "HOME",
+    "LANG",
+    "PATH"
+  ],
+  "cleared_outputs": [],
+  "started": "2026-11-20T16:03:36+00:00",
+  "stored_values": [],
+  "ended": "2026-11-20T16:03:36+00:00",
+  "exit_code": 0,
+  "run_folder": "<tmp>",
+  "verdict": "reproduced",
+  "claim": "Running these exact files with the declared command produced the declared outputs within the declared tolerances. This does not show that the outputs were computed rather than stored or fetched, that the method is correct, or that the result holds on other machines.",
+  "expectations": [
+    {
+      "output": "stdout (text)",
+      "expected": "[487, 267]",
+      "observed": "[487, 267]",
+      "matched": true
+    }
+  ],
+  "runner": {
+    "runner": "GitHub Actions, research-box rerun workflow (beta)",
+    "repository": "PaoloTCS/research-box",
+    "workflow_run": "https://github.com/PaoloTCS/research-box/actions/runs/44769439552",
+    "workflow_sha": "333e52a2f8b55f4d3a1e7009f530dd8fef0735d7",
+    "runner_image": "ubuntu24 20261116.376.1",
+    "runs": 3,
+    "verdicts": [
+      "reproduced",
+      "reproduced",
+      "reproduced"
+    ],
+    "all_reproduced": true,
+    "observed_identical": true,
+    "source": {
+      "url": "examples/prime-numbers at 333e52a2f8b55f4d3a1e7009f530dd8fef0735d7",
+      "sha256": "6c869004ef39d45c0ff4b69ff16ce6ed70c41480628f93a05bb790089e5933b3"
+    },
+    "submitter": "research-box example (first signed rerun)",
+    "assembled": "2026-11-20T16:03:48+00:00"
+  }
+}

@@ -1,0 +1,20 @@
+<!doctype html><meta charset="utf-8">
+<title>Declared outputs reproduced (automated rerun on GitHub Actions): prime-numbers</title>
+<h1>Declared outputs reproduced (automated rerun on GitHub Actions): prime-numbers</h1>
+<p><b>Verdict:</b> reproduced; runs: reproduced, reproduced, reproduced; no network.</p>
+<p><b>What this shows:</b> Running these exact files with the declared command produced the declared outputs within the declared tolerances. This does not show that the outputs were computed rather than stored or fetched, that the method is correct, or that the result holds on other machines.</p>
+<table><tr><th>Output</th><th>Expected</th><th>Observed (run 1)</th><th></th></tr><tr><td>stdout (text)</td><td>[487, 267]</td><td>[487, 267]</td><td>match</td></tr></table>
+
+<h2>Run</h2><p>drop sha256:beb36bf193280a3888938795e497138a088a0b3c5264434f2b78acedf2c1164b<br>
+Linux-7.0.0-1014-aws-x86_64-with-glibc2.39, Python 3.12.3, research-box 0.5.0<br>
+runner image ubuntu24 20261116.376.1<br>
+workflow run <a href="https://github.com/PaoloTCS/research-box/actions/runs/44769439552">https://github.com/PaoloTCS/research-box/actions/runs/44769439552</a> at commit 333e52a2f8b55f4d3a1e7009f530dd8fef0735d7<br>
+drop file examples/prime-numbers at 333e52a2f8b55f4d3a1e7009f530dd8fef0735d7 (sha256 6c869004ef39d45c0ff4b69ff16ce6ed70c41480628f93a05bb790089e5933b3)</p>
+<h2>Check it yourself</h2><pre>gh attestation verify report.json --repo PaoloTCS/research-box \
+  --signer-workflow PaoloTCS/research-box/.github/workflows/rerun.yml
+python3 build_box.py DROP --verify-report report.json --attested-by PaoloTCS/research-box</pre>
+<p>The signature is GitHub's keyless signing through Sigstore, tied to this repository's
+rerun workflow, and recorded in Sigstore's public transparency log. It shows which workflow
+produced the report, not that the result is correct.</p>
+<p><small>research-box is built with Claude, by Anthropic. Anthropic does not run or endorse
+these reruns.</small></p>

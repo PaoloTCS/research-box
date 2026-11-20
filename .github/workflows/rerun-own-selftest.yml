@@ -1,0 +1,25 @@
+name: rerun in your own repository (self-test)
+
+# Calls rerun-own.yml the way someone else's repository would, on the harmonic-numbers example.
+# On pull requests it reruns and checks but signs nothing; started by hand, it signs.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/rerun-own*.yml"
+      - ".github/rerun/**"
+      - "research-box/scripts/build_box.py"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  rerun:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/rerun-own.yml
+    with:
+      box: examples/harmonic-numbers
+      sign: ${{ github.event_name == 'workflow_dispatch' }}

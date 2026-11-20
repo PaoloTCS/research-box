@@ -70,3 +70,44 @@ maintainer adds the label `rerun-approved`. `RERUN_SITE` changes the address use
 
 A maintainer can test a change without signing or publishing anything: start `rerun.yml` by
 hand with `dry_run` ticked.
+
+## Rerun in your own repository (beta)
+
+Anyone can rerun a box in their own public repository, on their own Actions minutes, with the
+same checks and the same keyless signature. Add this file to your repository as
+`.github/workflows/rerun.yml`, then start it from the Actions tab:
+
+```yaml
+name: rerun my box
+on: workflow_dispatch
+permissions: {}
+jobs:
+  rerun:
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: PaoloTCS/research-box/.github/workflows/rerun-own.yml@main
+    with:
+      box: path/to/your/box   # the folder with box.json; "." for the repository root
+```
+
+Instead of `box`, you can give `drop_url` and `drop_sha256` for a drop archive elsewhere. Pin
+`@main` to a tag or a commit if you want the exact same tools every time.
+
+The run builds the drop from your box, reruns it three times with no network (each run capped
+at 5 minutes), checks the run reports against the drop, and signs `report.json`. The report,
+its page and the signature bundle are kept as the run's `rerun-report` artifact, and the
+attestation is stored in your repository. The signature names this repository's shared
+workflow at its exact commit, so anyone can check it:
+
+```
+gh attestation verify report.json --repo YOU/YOUR-REPO \
+  --signer-workflow PaoloTCS/research-box/.github/workflows/rerun-own.yml
+python3 build_box.py DROP --verify-report report.json --attested-by YOU/YOUR-REPO \
+  --signer-workflow PaoloTCS/research-box/.github/workflows/rerun-own.yml
+```
+
+GitHub only gives free public signatures to public repositories, so use a public one.
+`rerun-own-selftest.yml` calls the shared workflow on the harmonic-numbers example: on pull
+requests it signs nothing, and started by hand it signs.

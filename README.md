@@ -7,7 +7,7 @@ Say "make a box called prime-numbers", "add this sheet to the box", "drop the bo
 - **Live layer:** links that stay current. Agents of the same assistant hand each other links, not files.
 - **Snapshot layer:** a dropped folder with exported files, a readable `BOX.md`, an RO-Crate 1.1 `ro-crate-metadata.json`, and SHA-256 checksums of every file.
 - **Sharing levels:** private, same assistant, shareable. A drop for wider readers leaves out what is not cleared for them, writes a clean copy that holds nothing else, and says what it left out.
-- **Checks:** `--check` tells you whether any file in a drop, including its own description, changed or was copied stale, and a list of watch words flags private terms that are about to leave in a shareable drop.
+- **Checks:** `--check` tells you whether any file in a drop, including its own description, changed or was copied stale, and a list of watch words flags private terms that are about to leave in a shareable drop, including inside Word, Excel, PowerPoint and OpenDocument files.
 - **Reproduce:** a box can declare one command and what its output should be. Whoever opens the drop runs `--reproduce`: it checks the checksums, asks, runs the command on a temporary copy and reports whether the result reproduced, with numbers compared within stated tolerances or bounds.
 - **Signed reproductions:** whoever reproduced a box can sign the JSON report with an SSH key, and `--verify-report` checks, without running anything, that a trusted key signed a report saying this exact drop reproduced.
 
@@ -64,7 +64,9 @@ research-box/
   assets/box.example.json      an example box
   LICENSE                      Apache License 2.0
   NOTICE                       copyright and attribution
-.claude-plugin/                plugin manifest, marketplace file and icon
+.claude-plugin/                plugin manifest and marketplace file
+docs/                          icon and demo recording
+.github/workflows/ci.yml       tests on Linux, macOS and Windows
 examples/prime-numbers/        a small box to try the script on
 tests/test_build_box.py        unittest suite, standard library only
 ```
@@ -73,7 +75,7 @@ tests/test_build_box.py        unittest suite, standard library only
 
 ## Try it
 
-The commands and the output in [Quick demo](#quick-demo) were run against this revision. To run the 57-test suite (the 11 signature tests need `ssh-keygen` and are skipped without it):
+The commands and the output in [Quick demo](#quick-demo) were run against this revision. To run the 74-test suite (Python 3.10 or later) (the 11 signature tests need `ssh-keygen` and are skipped without it):
 
 ```
 python3 -m unittest discover tests
@@ -107,6 +109,7 @@ The one exception is `--reproduce`, which runs the command a box declares, and o
 
 ## Versions
 
+- **0.4.1** (November 20, 2026), after an outside review: watch words are found in the text and properties of Word, Excel, PowerPoint and OpenDocument files, inside identifiers such as `name_v2`, and in phrases joined by `_` or `-`; `--strict` also refuses while any file could not be scanned, until `--allow-unscanned` confirms it was checked by eye; generated files use LF line endings and `/` paths on every system; the skill gives script paths relative to its own folder; the plugin icon moved out of `.claude-plugin/`; tests run on Linux, macOS and Windows. 74 tests.
 - **0.4.0** (November 20, 2026): signed reproduction reports. `--verify-report` checks a `--report` file signed with an SSH key (`ssh-keygen -Y sign -n research-box-report`) against an OpenSSH `allowed_signers` file: the drop must match its manifests, the signature must verify, the report must name this exact drop and say it reproduced. It runs nothing from the box; exit 0 verified, 1 does not match, 2 could not check. 57 tests.
 - **0.3.0** (November 20, 2026): reproduce on open. A box can declare one command (`reproduce` in `box.json`) and its expected output: exact bytes, exact text, or named numbers with tolerances and bounds. `--reproduce` runs `--check` first, shows the command and asks before running it on a temporary copy, without a shell and with a minimal environment and a timeout, then reports reproduced or not; `--report` writes the result as JSON. Drops refuse a reproduce command with a path outside the box or one that needs a file the drop does not hold, and record it in the RO-Crate metadata as a `CreateAction`. 43 tests.
 - **0.2.5** (November 19, 2026), from the first real user's bug report: watch words match whole words and phrases, not substrings, so a short private term no longer matches inside ordinary words such as "file" and blocks every strict drop; each hit is reported with its file, line and context; held-back state lines and box details are reported like held-back items. 27 tests.

@@ -73,7 +73,7 @@ A dropped box is a folder:
 - `revision` (optional) is the live object's revision when the snapshot was made.
 - `state` lines are plain strings, which carry the box's default sharing, or objects with their own `sharing`. Drops keep each line as written, so a label survives later exports.
 - `public` (optional) replaces title, description, topics and state in drops wider than `default_sharing`. Without it, such drops show only the box name.
-- `private_terms` (optional) are words or phrases the script looks for in shareable drops: every generated file and every text snapshot. Each term matches as a whole word, in any case, so `ODE` finds "ODE" but not "code"; a phrase also matches across a line break. Each hit is reported with its file, line and surrounding text; binary files are listed for checking by eye.
+- `private_terms` (optional) are words or phrases the script looks for in shareable drops: every generated file and every text snapshot. Each term matches as a whole word, in any case, so `ODE` finds "ODE" but not "code"; `_` counts as a word boundary, so `bluefin` finds `bluefin_v2`, and a phrase also matches across a line break, `_` or `-`. Each hit is reported with its file, line and surrounding text; Word, Excel, PowerPoint and OpenDocument files are read as text; other binary files are listed for checking by eye.
 - `level_labels` (optional) maps the labels of the user's registry to the three levels.
 - `reproduce` (optional) declares one command whose output proves a result, so whoever opens a drop can rerun it with `--reproduce`:
   - `command` is a list: the program, then its arguments. It runs without a shell, so pipes, globs and `$VARS` are not expanded; put several steps in a script under `code/`. No argument may be an absolute or home path or contain `..`, and an argument naming a box file must be a snapshot the drop holds.
@@ -86,17 +86,18 @@ A dropped box is a folder:
 ## Building the manifest
 
 ```
-python3 scripts/build_box.py <box-folder> [--for shareable|same-assistant|private] [--out <new-folder>] [--strict]
-python3 scripts/build_box.py <box-folder> --check
-python3 scripts/build_box.py <dropped-box> --reproduce [--yes] [--timeout SECONDS] [--report FILE]
-python3 scripts/build_box.py --help
+python3 <skill folder>/scripts/build_box.py <box-folder> [--for shareable|same-assistant|private] [--out <new-folder>] [--strict [--allow-unscanned]]
+python3 <skill folder>/scripts/build_box.py <box-folder> --check
+python3 <skill folder>/scripts/build_box.py <dropped-box> --reproduce [--yes] [--timeout SECONDS] [--report FILE]
+python3 <skill folder>/scripts/build_box.py <dropped-box> --verify-report REPORT --allowed-signers FILE [--signer ID] [--signature FILE]
+python3 <skill folder>/scripts/build_box.py --help
 ```
 
 The script reads `<box-folder>/box.json` and writes `BOX.md`, `ro-crate-metadata.json` and `manifest-sha256.txt`.
 
 - `--for` sets the audience. Items, state lines and box details narrower than the audience are left out of every output.
 - `--out` writes a clean copy into a new or empty folder: the cleared snapshot files, the generated files and a `box.json` filtered to the kept items. Shareable copies also lose `public`, `level_labels` and `private_terms`, since those name what was held back. `--out` is required whenever the drop holds anything back (items, state lines or the box's own details): without it the script refuses and writes nothing, so held-back files and a full `box.json` can never sit beside what is shared. A drop that holds nothing back may be written in place; the script then lists any files in the folder that the drop does not cover.
-- `--strict` refuses a shareable drop, writing nothing, when a watch word appears in any generated file or text snapshot. Without it, watch words are only reported.
+- `--strict` refuses a shareable drop, writing nothing, when a watch word appears in any generated file, text snapshot, or the text and properties of a Word, Excel, PowerPoint or OpenDocument file. It also refuses while any file could not be scanned (PDF, images, archives, unreadable files, Office files with embedded media), listing them; after checking those by eye, add `--allow-unscanned` to drop anyway. Without `--strict`, watch words and unscanned files are only reported.
 - `--check` compares a dropped folder with `manifest-sha256.txt` and `tagmanifest-sha256.txt` and reports changed, missing and unlisted files. It writes nothing. Exit status: 0 when everything matches, 1 when a file changed, went missing or is not listed (or a manifest names a path outside the folder), 2 when the check is incomplete (no manifest or no tag manifest) or the command line is wrong. Scripts and pipelines can gate on it. Run it after every copy, at the destination, and before a refresh.
 
 - `--reproduce` reruns a dropped box's declared command and compares its output with `expect`. It runs `--check` first and stops unless the drop matches (exit 1, or 2 without manifests), then shows the command, the timeout and `requires` and asks before running (`--yes` skips the question; `--timeout` overrides the box's). The command runs on a temporary copy of the drop, so no output lands in the drop, with only `PATH`, `LANG` and a temporary `HOME` from the environment. This is not a sandbox: the box's code runs with the opener's permissions and can reach the network, so run boxes from strangers in a container or virtual machine. Exit status: 0 reproduced, 1 did not reproduce (an output differed or the command failed), 2 not run or inconclusive (no reproduce block, declined, could not start, or timed out). `--report <file>` (outside the drop) writes the result as JSON: box name, drop date, `drop_id` (the SHA-256 of `tagmanifest-sha256.txt`, which identifies the drop), command, platform, Python version, times, each expectation with its observed value, and the verdict. The temporary folder is reported as `<tmp>`.

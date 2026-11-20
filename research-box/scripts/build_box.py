@@ -2,7 +2,8 @@
 """Build BOX.md, ro-crate-metadata.json and manifest-sha256.txt for a research box.
 
 Usage:
-  python3 build_box.py <box-folder> [--for shareable|same-assistant|private] [--out <folder>] [--strict]
+  python3 build_box.py <box-folder> [--for shareable|same-assistant|private] [--out <folder>]
+                       [--strict [--allow-unscanned]]
   python3 build_box.py <box-folder> --check
   python3 build_box.py <dropped-box> --reproduce [--yes] [--timeout SECONDS] [--report FILE]
   python3 build_box.py <dropped-box> --verify-report REPORT --allowed-signers FILE
@@ -24,7 +25,9 @@ Reads <box-folder>/box.json (format in references/box-format.md). Standard libra
           listed, 2 = the check is incomplete (no manifest or no tag manifest). Run it after
           every copy and before a refresh.
 --strict  Refuse a shareable drop, writing nothing, when a watch word (private_terms) appears
-          in any generated file or text snapshot. Without it, watch words are reported only.
+          in any generated file, text snapshot or Office/OpenDocument file, or when a file
+          cannot be scanned (PDFs, images, embedded files) unless --allow-unscanned is given
+          after checking those files by eye. Without it, both are reported only.
 --reproduce
           Run the box's declared command (box.json "reproduce") and compare its output with
           what the box expects. It runs --check first and stops unless the drop matches,
@@ -63,6 +66,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePath
 
@@ -110,10 +115,65 @@ def inside(folder, rel):
 
 
 def term_pattern(term):
-    """Match a watch word as a whole word or phrase, any case. Spaces inside a phrase
-    match any run of whitespace, so a phrase broken across lines is still found."""
+    """Match a watch word as a whole word or phrase, any case. A word ends at anything
+    that is not a letter or digit, so "lantern" is found in lantern_key or LANTERN-2 but
+    not in "lanterns". Spaces inside a phrase match any run of whitespace, underscores or
+    hyphens, so a phrase broken across lines, or written as project_lantern, is found."""
     words = [re.escape(w) for w in term.split()]
-    return re.compile(r"(?<!\w)" + r"\s+".join(words) + r"(?!\w)", re.IGNORECASE)
+    return re.compile(r"(?<![^\W_])" + r"[\s_\-]+".join(words) + r"(?![^\W_])",
+                      re.IGNORECASE)
+
+
+# Office files (Word, Excel, PowerPoint and OpenDocument) are zip archives of XML. Their
+# text, comments, sheet names and document properties are read with the standard library
+# so watch words in them are found. Other binary files (PDF, images) cannot be read here.
+OFFICE = {".docx", ".docm", ".dotx", ".xlsx", ".xlsm", ".xltx", ".pptx", ".pptm", ".potx",
+          ".odt", ".ods", ".odp", ".odg"}
+OFFICE_LIMIT = 200 * 1024 * 1024  # uncompressed bytes read from one file, at most
+# Elements that end a paragraph, cell or property, so text in neighbouring cells is not
+# run together; runs inside a paragraph are joined as written.
+BLOCKS = {"p", "h", "si", "c", "is", "tc", "tr", "row", "table-cell", "comment", "text",
+          "title", "subject", "creator", "keywords", "description", "lastModifiedBy",
+          "category", "Company", "Manager", "sheet", "definedName", "cellComment"}
+
+
+def _flatten(el, parts):
+    for value in el.attrib.values():
+        parts.append("\n" + value + "\n")
+    if el.text:
+        parts.append(el.text)
+    for child in el:
+        _flatten(child, parts)
+        if child.tail:
+            parts.append(child.tail)
+    if el.tag.rsplit("}", 1)[-1] in BLOCKS:
+        parts.append("\n")
+
+
+def office_text(path):
+    """Text of an Office or OpenDocument file, and the names of parts that could not be
+    read (embedded pictures or files). Returns (None, reason) if it is not readable."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            members = [m for m in z.infolist() if not m.is_dir()]
+            if sum(m.file_size for m in members) > OFFICE_LIMIT:
+                return None, "too large to read"
+            parts, skipped = [], []
+            for m in members:
+                if not m.filename.endswith(".xml"):
+                    if not m.filename.endswith(".rels") and m.filename != "mimetype":
+                        skipped.append(m.filename)
+                    continue
+                try:
+                    root = ET.fromstring(z.read(m))
+                except ET.ParseError:
+                    skipped.append(m.filename)
+                    continue
+                parts.append(f"\n[{m.filename}]\n")
+                _flatten(root, parts)
+            return "".join(parts), skipped
+    except (zipfile.BadZipFile, OSError, RuntimeError, NotImplementedError) as err:
+        return None, f"not a readable archive ({err})"
 
 
 def find_terms(text, patterns):
@@ -130,7 +190,7 @@ def find_terms(text, patterns):
 
 
 def all_files(folder):
-    return sorted(str(p.relative_to(folder)) for p in folder.rglob("*")
+    return sorted(p.relative_to(folder).as_posix() for p in folder.rglob("*")
                   if p.is_file() and not p.name.startswith("."))
 
 
@@ -460,7 +520,7 @@ def reproduce(folder, args):
                                     for label, expected, observed, matched in rows])
         report.parent.mkdir(parents=True, exist_ok=True)
         report.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n",
-                          encoding="utf-8")
+                          encoding="utf-8", newline="\n")
         print(f"Report written to {report}.")
     return code
 
@@ -585,6 +645,9 @@ def parse(argv):
                    help="write a clean copy here; required when the drop holds anything back")
     p.add_argument("--strict", action="store_true",
                    help="refuse a shareable drop, writing nothing, if any watch word is found")
+    p.add_argument("--allow-unscanned", action="store_true",
+                   help="with --strict: accept files that could not be scanned for watch "
+                        "words (PDFs, images), after checking them by eye")
     p.add_argument("--check", action="store_true",
                    help="compare a dropped box with its manifests; exit 0 match, 1 difference, "
                         "2 no manifest or no tag manifest (incomplete check)")
@@ -624,6 +687,8 @@ def parse(argv):
     if args.reproduce and (args.check or args.out or args.strict or args.audience != "private"):
         p.error("--reproduce runs on a dropped box; use it without --check, --for, --out "
                 "or --strict")
+    if args.allow_unscanned and not args.strict:
+        p.error("--allow-unscanned goes with --strict")
     if args.timeout is not None and args.timeout <= 0:
         p.error("--timeout must be a positive number of seconds")
     return args
@@ -907,14 +972,26 @@ def main(argv):
     # is scanned in full: every generated file and every text snapshot.
     terms = [t for t in box.get("private_terms", []) if t and t.strip()]
     patterns = [(t, term_pattern(t)) for t in terms]
-    hits, binaries = {}, []
+    hits, unscanned = {}, []
     if terms and audience == "shareable":
         scan = dict(texts)
         for _, rel, _ in sums:
+            path = folder / rel
+            if path.suffix.lower() in OFFICE:
+                text, skipped = office_text(path)
+                if text is None:
+                    unscanned.append(f"{rel} ({skipped})")
+                    continue
+                scan[rel] = text
+                if skipped:
+                    unscanned.append(f"{rel} (embedded: {', '.join(skipped[:3])}"
+                                     + (f" and {len(skipped) - 3} more" if len(skipped) > 3
+                                        else "") + ")")
+                continue
             try:
-                scan[rel] = (folder / rel).read_text(encoding="utf-8")
+                scan[rel] = path.read_text(encoding="utf-8")
             except (UnicodeDecodeError, ValueError):
-                binaries.append(rel)  # PDF, XLSX, PNG: check those by eye
+                unscanned.append(rel)  # PDF, images, other binary files: check by eye
         for name, text in scan.items():
             found = find_terms(text, patterns)
             if found:
@@ -927,6 +1004,10 @@ def main(argv):
     if hits and args.strict:
         refuse("Strict mode: watch words found in "
                + "; ".join(describe(n, f) for n, f in hits.items()) + ".")
+    if unscanned and args.strict and not args.allow_unscanned:
+        refuse("Strict mode: these files could not be scanned for watch words: "
+               + ", ".join(unscanned) + ". Check them by eye, then drop again with "
+               "--allow-unscanned, or leave them out.")
 
     target = out or folder
     if out:
@@ -935,14 +1016,14 @@ def main(argv):
             (out / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(folder / rel, out / rel)
     for name in ("manifest-sha256.txt", "BOX.md", "ro-crate-metadata.json"):
-        (target / name).write_text(texts[name], encoding="utf-8")
+        (target / name).write_text(texts[name], encoding="utf-8", newline="\n")
     if out:
-        (out / "box.json").write_text(texts["box.json"], encoding="utf-8")
+        (out / "box.json").write_text(texts["box.json"], encoding="utf-8", newline="\n")
     # Tag manifest (as in BagIt): checksums of the drop's own description files, so a
     # stale or edited BOX.md or box.json is caught as well as a changed snapshot.
     (target / "tagmanifest-sha256.txt").write_text(
         "".join(f"{sha256(target / n)}  {n}\n" for n in TAGGED if (target / n).is_file()),
-        encoding="utf-8")
+        encoding="utf-8", newline="\n")
 
     print(f"{box['box']}: {len(kept)} item(s) kept, {len(sums)} file(s) checksummed"
           + (f", written to {out}" if out else ""))
@@ -959,8 +1040,10 @@ def main(argv):
         print("Fields outside the format, left out of the copy: " + ", ".join(extra_fields))
     for name, found in hits.items():
         print(f"Watch words in {describe(name, found)} (advisory; --strict refuses the drop)")
-    if binaries:
-        print("Not scanned for watch words (binary): " + ", ".join(binaries))
+    if unscanned:
+        print("Not scanned for watch words (check these by eye"
+              + ("" if args.strict else "; --strict refuses the drop until you do") + "): "
+              + ", ".join(unscanned))
     if not out:
         listed = {rel for _, rel, _ in sums}
         unlisted = [r for r in all_files(folder) if r not in listed and r not in GENERATED]

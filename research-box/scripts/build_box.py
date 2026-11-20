@@ -31,6 +31,7 @@ The script never deletes anything.
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import sys
 from pathlib import Path, PurePath
@@ -75,6 +76,26 @@ def inside(folder, rel):
     except ValueError:
         return False
     return True
+
+
+def term_pattern(term):
+    """Match a watch word as a whole word or phrase, any case. Spaces inside a phrase
+    match any run of whitespace, so a phrase broken across lines is still found."""
+    words = [re.escape(w) for w in term.split()]
+    return re.compile(r"(?<!\w)" + r"\s+".join(words) + r"(?!\w)", re.IGNORECASE)
+
+
+def find_terms(text, patterns):
+    """Return (term, line number, context) for the first occurrence of each term."""
+    found = []
+    for term, pattern in patterns:
+        m = pattern.search(text)
+        if m:
+            line = text.count("\n", 0, m.start()) + 1
+            start, end = max(0, m.start() - 30), min(len(text), m.end() + 30)
+            context = " ".join(text[start:end].split())
+            found.append((term, line, context))
+    return found
 
 
 def all_files(folder):
@@ -338,7 +359,8 @@ def main(argv):
 
     # Watch words: terms that should not reach other assistants or people. A shareable drop
     # is scanned in full: every generated file and every text snapshot.
-    terms = [t for t in box.get("private_terms", []) if t]
+    terms = [t for t in box.get("private_terms", []) if t and t.strip()]
+    patterns = [(t, term_pattern(t)) for t in terms]
     hits, binaries = {}, []
     if terms and audience == "shareable":
         scan = dict(texts)
@@ -348,12 +370,17 @@ def main(argv):
             except (UnicodeDecodeError, ValueError):
                 binaries.append(rel)  # PDF, XLSX, PNG: check those by eye
         for name, text in scan.items():
-            found = [t for t in terms if t.lower() in text.lower()]
+            found = find_terms(text, patterns)
             if found:
                 hits[name] = found
+
+    def describe(name, found):
+        return "; ".join(f'{name} line {line}: {term} ("...{context}...")'
+                         for term, line, context in found)
+
     if hits and args.strict:
         refuse("Strict mode: watch words found in "
-               + "; ".join(f"{n} ({', '.join(f)})" for n, f in hits.items()) + ".")
+               + "; ".join(describe(n, f) for n, f in hits.items()) + ".")
 
     target = out or folder
     if out:
@@ -375,10 +402,15 @@ def main(argv):
           + (f", written to {out}" if out else ""))
     if left_out:
         print(f"Left out for {audience} readers: " + ", ".join(it["item"] for it in left_out))
+    if state_held:
+        print(f"Held back for {audience} readers: {state_held} state line(s)")
+    if not use_box:
+        print(f"Held back for {audience} readers: the box's own title, description, topics and "
+              f"state" + (" (the public block was used instead)" if box.get("public") else ""))
     if extra_fields and out:
         print("Fields outside the format, left out of the copy: " + ", ".join(extra_fields))
     for name, found in hits.items():
-        print(f"Watch words in {name}: {', '.join(found)} (advisory; --strict refuses the drop)")
+        print(f"Watch words in {describe(name, found)} (advisory; --strict refuses the drop)")
     if binaries:
         print("Not scanned for watch words (binary): " + ", ".join(binaries))
     if not out:

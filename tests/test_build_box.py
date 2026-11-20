@@ -75,7 +75,7 @@ class BuildBoxTests(unittest.TestCase):
         self.assertNotIn("Working notes", box_md)
         self.assertNotIn("Open question", box_md)
         self.assertIn("Prime-based addressing", box_md)
-        self.assertIn("Watch words in code/simulate.py: Project Lantern", r.stdout)
+        self.assertIn("Watch words in code/simulate.py line 1: Project Lantern", r.stdout)
 
     def test_out_folder_must_be_empty(self):
         out = self.tmp / "share"
@@ -200,6 +200,35 @@ class BuildBoxTests(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("Strict mode", r.stderr)
         self.assertFalse(out.exists())
+
+    def test_watch_word_does_not_match_inside_other_words(self):
+        # "ODE" is inside "code", which every drop of this box writes (an item's kind).
+        self.edit_box(lambda d: d.update(private_terms=["ODE"]))
+        r = run(self.box, "--for", "shareable", "--out", self.tmp / "share", "--strict")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Watch words", r.stdout)
+
+    def test_watch_word_matches_as_a_whole_word(self):
+        self.edit_box(lambda d: d.update(private_terms=["ODE"]))
+        with open(self.box / "code" / "simulate.py", "a") as f:
+            f.write("# solve the ODE numerically\n")
+        r = run(self.box, "--for", "shareable", "--out", self.tmp / "share", "--strict")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("code/simulate.py line", r.stderr)
+        self.assertIn("solve the ODE numerically", r.stderr)
+
+    def test_watch_phrase_is_found_across_a_line_break(self):
+        with open(self.box / "sheet" / "results.csv", "a") as f:
+            f.write("notes from Project\nLantern work\n")
+        self.edit_box(lambda d: d["items"][2].update(snapshot=[]))  # leave only the CSV hit
+        r = run(self.box, "--for", "shareable", "--out", self.tmp / "share", "--strict")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("sheet/results.csv", r.stderr)
+
+    def test_held_back_state_line_is_reported(self):
+        r = run(self.box, "--for", "same-assistant", "--out", self.tmp / "assistant")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Held back for same-assistant readers: 1 state line(s)", r.stdout)
 
     def test_watch_words_are_found_in_generated_files(self):
         self.edit_box(lambda d: d["items"][1].update(notes="from Project Lantern"))

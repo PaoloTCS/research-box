@@ -57,7 +57,7 @@ A dropped box is a folder:
 - `revision` (optional) is the live object's revision when the snapshot was made.
 - `state` lines are plain strings, which carry the box's default sharing, or objects with their own `sharing`. Drops keep each line as written, so a label survives later exports.
 - `public` (optional) replaces title, description, topics and state in drops wider than `default_sharing`. Without it, such drops show only the box name.
-- `private_terms` (optional) are words the script looks for in shareable drops: item names, notes, state lines and text files. It reports each hit; binary files are listed for checking by eye.
+- `private_terms` (optional) are words or phrases the script looks for in shareable drops: every generated file and every text snapshot. Each term matches as a whole word, in any case, so `ODE` finds "ODE" but not "code"; a phrase also matches across a line break. Each hit is reported with its file, line and surrounding text; binary files are listed for checking by eye.
 - `level_labels` (optional) maps the labels of the user's registry to the three levels.
 - Fields other than those above are never copied into a drop's `box.json`, and a drop for readers other than the user that would carry them must use `--out`.
 

@@ -5,7 +5,7 @@ license: Apache-2.0
 metadata:
   author: Paolo Pignatelli
   developed-with: Claude (Anthropic)
-  version: "0.2.4"
+  version: "0.2.5"
 ---
 
 # Research boxes
@@ -39,7 +39,7 @@ Two rules hold everywhere:
 
 The box's own details (title, description, topics, state lines) carry the box's default sharing. For a wider drop, give a `public` block in `box.json` with wording cleared for those readers; without one, a wider drop shows only the box name.
 
-The user may mark topics or folders as never leaving their machine. Respect that above any level. Terms that must not reach other assistants can be listed as `private_terms`; the script reports every place a shareable drop still contains them, including generated files and files whose own level says Shareable. The report is advisory; with `--strict` the drop is refused and nothing is written until the terms are gone.
+The user may mark topics or folders as never leaving their machine. Respect that above any level. Terms that must not reach other assistants can be listed as `private_terms`; the script reports every place a shareable drop still contains them as whole words, with file, line and context, including generated files and files whose own level says Shareable. The report is advisory; with `--strict` the drop is refused and nothing is written until the terms are gone.
 
 ## Commands
 

@@ -2,7 +2,9 @@
 
 Run from the repository root:  python3 -m unittest discover tests
 """
+import base64
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -773,6 +775,252 @@ class WatchWordScanTests(unittest.TestCase):
         r = run(self.box, "--for", "shareable", "--out", self.tmp / "s", "--allow-unscanned")
         self.assertEqual(r.returncode, 2)
         self.assertIn("goes with --strict", r.stderr)
+
+
+def load_script():
+    spec = importlib.util.spec_from_file_location("build_box", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def can_drop_network():
+    exe = shutil.which("unshare")
+    if not sys.platform.startswith("linux") or exe is None:
+        return False
+    r = subprocess.run([exe, "--map-root-user", "--net", "--", sys.executable, "-c", ""],
+                       capture_output=True)
+    return r.returncode == 0
+
+
+NETWORK_SCRIPT = """import json, socket
+s = socket.socket()
+s.settimeout(2)
+try:
+    s.connect(("127.0.0.1", 9))
+    up = 1
+except ConnectionRefusedError:
+    up = 1
+except OSError:
+    up = 0
+print(json.dumps({"loopback_up": up}))
+"""
+
+
+class ReportClaimTests(unittest.TestCase):
+    """What a report records about the run, so a signature on it claims no more than the
+    run shows."""
+
+    setUp = ReproduceTests.setUp
+    tearDown = ReproduceTests.tearDown
+    edit_box = ReproduceTests.edit_box
+    drop = ReproduceTests.drop
+    add_values_box = ReproduceTests.add_values_box
+
+    def values_report(self):
+        self.add_values_box([{"source": "stdout", "match": "values", "values": [
+            {"key": "mean_stretch", "equals": 2.84, "abs": 0.01},
+            {"key": "false_promotions", "equals": 7}]}])
+        out = self.drop()
+        report = self.tmp / "report.json"
+        r = run(out, "--reproduce", "--yes", "--report", report)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r, json.loads(report.read_text())
+
+    def test_report_states_its_claim_and_conditions(self):
+        r, data = self.values_report()
+        self.assertIn("does not show that the outputs were computed", data["claim"])
+        self.assertEqual(data["network"], "not restricted")
+        self.assertTrue(data["tool"].startswith("research-box "))
+        self.assertIn("PATH", data["environment"])
+        self.assertEqual(data["cleared_outputs"], [])
+
+    def test_values_written_in_the_code_are_flagged(self):
+        r, data = self.values_report()
+        flagged = {s["output"]: s for s in data["stored_values"]}
+        self.assertIn("stdout mean_stretch", flagged)  # 2.8412 is a literal in values.py
+        self.assertEqual(flagged["stdout mean_stretch"]["files"], ["code/values.py"])
+        self.assertNotIn("stdout false_promotions", flagged)  # 7 is too short to mean much
+        self.assertIn("already appear in the box's own files", r.stdout)
+
+    def test_output_file_already_in_the_drop_must_be_written_again(self):
+        (self.box / "code" / "quiet.py").write_text("print('done')\n")
+        (self.box / "out.txt").write_text("table\n")
+
+        def change(d):
+            d["items"].append({"item": "Quiet", "kind": "code", "live": None,
+                               "snapshot": ["code/quiet.py", "out.txt"],
+                               "sharing": "shareable"})
+            d["reproduce"] = {"command": ["python3", "code/quiet.py"], "sharing": "shareable",
+                              "expect": [{"source": "out.txt", "match": "sha256",
+                                          "value": hashlib.sha256(b"table\n").hexdigest()}]}
+        self.edit_box(change)
+        out = self.drop()
+        report = self.tmp / "report.json"
+        r = run(out, "--reproduce", "--yes", "--report", report)
+        self.assertEqual(r.returncode, 1, r.stdout)
+        data = json.loads(report.read_text())
+        self.assertEqual(data["cleared_outputs"], ["out.txt"])
+        self.assertTrue((out / "out.txt").is_file())  # the drop itself is untouched
+        self.assertEqual(run(out, "--check").returncode, 0)
+
+    def test_no_network_goes_with_reproduce(self):
+        r = run(self.box, "--no-network")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--no-network", r.stderr)
+
+    @unittest.skipUnless(can_drop_network(), "no unprivileged network namespaces here")
+    def test_no_network_runs_without_a_network(self):
+        (self.box / "code" / "net.py").write_text(NETWORK_SCRIPT)
+
+        def change(d):
+            d["items"].append({"item": "Net", "kind": "code", "live": None,
+                               "snapshot": ["code/net.py"], "sharing": "shareable"})
+            d["reproduce"] = {"command": ["python3", "code/net.py"], "sharing": "shareable",
+                              "expect": [{"source": "stdout", "match": "values", "values": [
+                                  {"key": "loopback_up", "equals": 0}]}]}
+        self.edit_box(change)
+        out = self.drop()
+        report = self.tmp / "report.json"
+        r = run(out, "--reproduce", "--yes", "--no-network", "--report", report)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(json.loads(report.read_text())["network"],
+                         "none (Linux network namespace)")
+        r = run(out, "--reproduce", "--yes")
+        self.assertEqual(r.returncode, 1, r.stdout)  # with a network, loopback is up
+
+    @unittest.skipIf(can_drop_network(), "network namespaces are available here")
+    def test_no_network_refuses_where_it_cannot_cut_the_network(self):
+        out = self.drop()
+        r = run(out, "--reproduce", "--yes", "--no-network")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("Nothing was run.", r.stdout)
+
+
+def tree_root(module, leaves):
+    """RFC 6962 Merkle tree hash, written out the slow way to check the script's proofs."""
+    if len(leaves) == 1:
+        return module.leaf_hash(leaves[0])
+    k = 1 << ((len(leaves) - 1).bit_length() - 1)
+    return module.node_hash(tree_root(module, leaves[:k]), tree_root(module, leaves[k:]))
+
+
+def tree_path(module, m, leaves):
+    if len(leaves) == 1:
+        return []
+    k = 1 << ((len(leaves) - 1).bit_length() - 1)
+    if m < k:
+        return tree_path(module, m, leaves[:k]) + [tree_root(module, leaves[k:])]
+    return tree_path(module, m - k, leaves[k:]) + [tree_root(module, leaves[:k])]
+
+
+class MerkleTests(unittest.TestCase):
+    def test_every_inclusion_proof_in_small_trees(self):
+        m = load_script()
+        for size in range(1, 34):
+            leaves = [f"leaf {i}".encode() for i in range(size)]
+            root = tree_root(m, leaves)
+            for i in range(size):
+                path = tree_path(m, i, leaves)
+                self.assertEqual(m.root_from_inclusion(i, size, m.leaf_hash(leaves[i]), path),
+                                 root, (size, i))
+                if size > 1:
+                    self.assertNotEqual(m.root_from_inclusion(
+                        i, size, m.leaf_hash(b"other"), path), root)
+
+    def test_bad_positions_are_refused(self):
+        m = load_script()
+        leaf = m.leaf_hash(b"x")
+        self.assertIsNone(m.root_from_inclusion(3, 3, leaf, []))
+        self.assertIsNone(m.root_from_inclusion(0, 4, leaf, [leaf]))  # path too short
+
+
+@unittest.skipUnless(SSH_KEYGEN, "ssh-keygen (OpenSSH 8.2 or later) is not installed")
+class LogProofTests(unittest.TestCase):
+    """--log-proof: the signed report must sit in a signed transparency-log checkpoint."""
+
+    setUp = VerifyReportTests.setUp
+    tearDown = VerifyReportTests.tearDown
+    key = VerifyReportTests.key
+    add_signer = VerifyReportTests.add_signer
+    sign = VerifyReportTests.sign
+    verify = VerifyReportTests.verify
+
+    def make_proof(self, log_key, index=3, size=5, origin="log.example/research-box",
+                   namespace="research-box-log", report_bytes=None):
+        m = load_script()
+        sig = self.sign(self.alice)
+        mine = m.report_leaf(report_bytes or self.report.read_bytes(), sig.read_bytes())
+        leaves = [f"other report {i}".encode() for i in range(size)]
+        leaves[index] = mine
+        root = tree_root(m, leaves)
+        checkpoint = f"{origin}\n{size}\n{base64.b64encode(root).decode()}\n"
+        cp = self.tmp / "checkpoint"
+        cp.write_text(checkpoint, newline="\n")
+        subprocess.run([SSH_KEYGEN, "-q", "-Y", "sign", "-f", str(log_key), "-n", namespace,
+                        str(cp)], check=True, capture_output=True)
+        proof = {"log": origin, "leaf_index": index, "tree_size": size,
+                 "inclusion": [h.hex() for h in tree_path(m, index, leaves)],
+                 "checkpoint": checkpoint,
+                 "checkpoint_signature": Path(str(cp) + ".sig").read_text()}
+        path = self.tmp / "proof.json"
+        path.write_text(json.dumps(proof))
+        return path
+
+    def log_signers(self, key):
+        public = (key.parent / (key.name + ".pub")).read_text().split()[:2]
+        path = self.tmp / "log_signers"
+        path.write_text(f'log@example.org namespaces="research-box-log" {" ".join(public)}\n')
+        return path
+
+    def test_logged_report_verifies(self):
+        log = self.key("log")
+        proof = self.make_proof(log)
+        r = self.verify("--log-proof", proof, "--log-signers", self.log_signers(log))
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("entry 3 of 5", r.stdout)
+        self.assertIn("logged as", r.stdout)
+
+    def test_without_a_proof_the_times_are_the_signers_word(self):
+        self.sign(self.alice)
+        r = self.verify()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("no log proof given", r.stdout)
+        self.assertIn("What the report claims:", r.stdout)
+
+    def test_proof_for_another_report_fails(self):
+        log = self.key("log")
+        proof = self.make_proof(log, report_bytes=b"{}")
+        r = self.verify("--log-proof", proof, "--log-signers", self.log_signers(log))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("not in the log", r.stdout)
+
+    def test_checkpoint_from_an_unknown_log_key_fails(self):
+        proof = self.make_proof(self.key("rogue"))
+        r = self.verify("--log-proof", proof, "--log-signers", self.log_signers(self.key("log")))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("checkpoint signature", r.stdout)
+
+    def test_checkpoint_signed_for_another_purpose_fails(self):
+        log = self.key("log")
+        proof = self.make_proof(log, namespace="file")
+        r = self.verify("--log-proof", proof, "--log-signers", self.log_signers(log))
+        self.assertEqual(r.returncode, 1, r.stdout)
+
+    def test_changed_tree_size_fails(self):
+        log = self.key("log")
+        proof = self.make_proof(log)
+        data = json.loads(proof.read_text())
+        data["tree_size"] = 6
+        proof.write_text(json.dumps(data))
+        r = self.verify("--log-proof", proof, "--log-signers", self.log_signers(log))
+        self.assertEqual(r.returncode, 1, r.stdout)
+
+    def test_log_proof_needs_log_signers(self):
+        self.sign(self.alice)
+        r = self.verify("--log-proof", self.tmp / "proof.json")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--log-signers", r.stderr)
 
 
 class RepositoryTests(unittest.TestCase):

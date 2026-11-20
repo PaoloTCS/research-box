@@ -56,6 +56,7 @@ The script never deletes anything. Runs of --reproduce are left in a temporary f
 which it names, so their outputs can be inspected.
 """
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -81,6 +82,15 @@ REPRO_KEYS = ["name", "command", "inputs", "requires", "timeout_seconds", "shari
 GENERATED = {"BOX.md", "box.json", "ro-crate-metadata.json", "manifest-sha256.txt",
              "tagmanifest-sha256.txt"}
 TAGGED = ["BOX.md", "box.json", "ro-crate-metadata.json", "manifest-sha256.txt"]
+VERSION = "0.5.0"
+# What a reproduction report (and so a signature on it) can claim, and what it cannot.
+REPORT_CLAIM = ("Running these exact files with the declared command produced the declared "
+                "outputs within the declared tolerances. This does not show that the outputs "
+                "were computed rather than stored or fetched, that the method is correct, or "
+                "that the result holds on other machines.")
+LITERAL_MIN_DIGITS = 4          # shorter numbers (0, 1, 42) appear in any code by chance
+LITERAL_MIN_TEXT = 8
+LITERAL_MAX_BYTES = 20 << 20
 
 
 def sha256(path):
@@ -407,6 +417,69 @@ def compare(e, raw):
     return rows
 
 
+def number_forms(value):
+    """Ways a printed number can be written literally in a file."""
+    if isinstance(value, int):
+        forms = {str(value)}
+        if abs(value) >= 10000:
+            forms |= {f"{value:_}", f"{value:,}"}
+    else:
+        forms = {repr(value)}
+    return [f for f in forms if sum(c.isdigit() for c in f) >= LITERAL_MIN_DIGITS]
+
+
+def stored_values(folder, literals, hashes):
+    """Best-effort scan: declared outputs whose values already sit, literally, in the box's
+    own files (not the generated ones). Returns [{"output", "value", "files"}]. A hit does
+    not prove a box is faked and no hit does not prove it is honest: a value can be
+    encoded or fetched. It tells a reader where to look."""
+    found = {}
+    for rel in all_files(Path(folder)):
+        if rel in GENERATED:
+            continue
+        path = Path(folder) / rel
+        try:
+            if path.stat().st_size > LITERAL_MAX_BYTES:
+                continue
+            data = path.read_bytes()
+        except OSError:
+            continue
+        digest = hashlib.sha256(data).hexdigest()
+        for label, value in hashes:
+            if digest == value:
+                found.setdefault((label, f"SHA-256 {value}"), []).append(rel)
+        text = data.decode("utf-8", errors="ignore")
+        for label, literal in literals:
+            if isinstance(literal, str):
+                hit = literal in text
+                shown = literal
+            else:
+                forms = number_forms(literal)
+                hit = any(re.search(r"(?<![\d.])" + re.escape(f) + r"(?![\d])", text)
+                          for f in forms)
+                shown = str(literal)
+            if hit:
+                found.setdefault((label, shown), []).append(rel)
+    return [{"output": label, "value": value, "files": files}
+            for (label, value), files in found.items()]
+
+
+def network_wrapper():
+    """Prefix that runs a command with no network: a new Linux network namespace with only
+    a loopback device that is down. None where that is not available."""
+    exe = shutil.which("unshare")
+    if not sys.platform.startswith("linux") or exe is None:
+        return None
+    prefix = [exe, "--map-root-user", "--net", "--"]
+    try:
+        probe = subprocess.run(prefix + [sys.executable, "-c", ""], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return prefix if probe.returncode == 0 else None
+
+
 def reproduce(folder, args):
     """Run a drop's reproduce command on a temporary copy and compare. Exit status:
     0 reproduced, 1 did not reproduce (or the drop does not match its manifests),
@@ -445,11 +518,19 @@ def reproduce(folder, args):
 
     timeout = args.timeout or block.get("timeout_seconds", DEFAULT_TIMEOUT)
     command = block["command"]
+    prefix = []
+    if args.no_network:
+        prefix = network_wrapper()
+        if prefix is None:
+            print("--no-network needs Linux with unshare and unprivileged user namespaces, "
+                  "and they are not available here. Nothing was run.")
+            return 2
     print("")
     print(f"Reproduce: {block.get('name', box.get('box', ''))}")
     print(f"  Command:  {command_text(command)}")
     print(f"  Runs in:  a temporary copy of {folder}")
     print(f"  Timeout:  {timeout:g} seconds")
+    print(f"  Network:  {'none' if prefix else 'not restricted'}")
     if block.get("requires"):
         print(f"  Requires: {block['requires']}")
     for e in block["expect"]:
@@ -470,6 +551,15 @@ def reproduce(folder, args):
     work = base / "box"
     shutil.copytree(folder, work)
     (base / "home").mkdir()
+    # A declared output file that is already in the drop would pass even if the command
+    # never wrote it, so remove it from the run copy first (unless the command reads it).
+    needed = set(reproduce_files(folder, block))
+    cleared = []
+    for e in block["expect"]:
+        src = e["source"]
+        if src != "stdout" and src not in needed and (work / src).is_file():
+            (work / src).unlink()
+            cleared.append(src)
     env = {"PATH": os.environ.get("PATH", ""), "LANG": os.environ.get("LANG", "C.UTF-8"),
            "HOME": str(base / "home")}
     for name in ("SYSTEMROOT", "SystemRoot"):  # Windows cannot start Python without it
@@ -481,10 +571,14 @@ def reproduce(folder, args):
               "drop_id": "sha256:" + sha256(folder / "tagmanifest-sha256.txt"),
               "command": command, "platform": platform.platform(),
               "python": platform.python_version(),
+              "tool": f"research-box {VERSION}",
+              "network": "none (Linux network namespace)" if prefix else "not restricted",
+              "environment": sorted(env),
+              "cleared_outputs": cleared,
               "started": started.isoformat(timespec="seconds")}
     rows, verdict, code, exit_code = [], "inconclusive", 2, None
     try:
-        proc = subprocess.run(command, cwd=work, env=env, stdin=subprocess.DEVNULL,
+        proc = subprocess.run(prefix + command, cwd=work, env=env, stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               timeout=timeout, shell=False)
     except subprocess.TimeoutExpired:
@@ -494,13 +588,29 @@ def reproduce(folder, args):
               f"that this machine has what the box requires.")
     else:
         exit_code = proc.returncode
+        literals, hashes = [], []
         for e in block["expect"]:
             if e["source"] == "stdout":
                 raw = proc.stdout
             else:
                 path = work / e["source"]
                 raw = path.read_bytes() if path.is_file() else None
-            rows += compare(e, raw)
+            got = compare(e, raw)
+            rows += got
+            if e["match"] == "sha256":
+                hashes.append((got[0][0], e["value"]))
+            elif e["match"] == "text" and len(e["value"].strip()) >= LITERAL_MIN_TEXT:
+                literals.append((got[0][0], e["value"].strip()))
+            else:
+                literals += [(r[0], r[2]) for r in got if r[3] and not isinstance(r[2], bool)
+                             and isinstance(r[2], (int, float))]
+        stored = stored_values(folder, literals, hashes)
+        result["stored_values"] = stored
+        if stored:
+            print("Note: these output values already appear in the box's own files, so the "
+                  "run may print them rather than compute them. Read the code to check:")
+            for s in stored:
+                print(f"  {s['output']} = {s['value']}: in {', '.join(s['files'])}")
         if exit_code != 0:
             tail = proc.stderr.decode("utf-8", errors="replace").strip().splitlines()[-5:]
             print(f"The command exited with status {exit_code}." +
@@ -515,6 +625,7 @@ def reproduce(folder, args):
     if report is not None:
         result.update(ended=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                       exit_code=exit_code, run_folder="<tmp>", verdict=verdict,
+                      claim=REPORT_CLAIM,
                       expectations=[{"output": label, "expected": expected,
                                      "observed": observed, "matched": matched}
                                     for label, expected, observed, matched in rows])
@@ -533,6 +644,92 @@ def reproduce(folder, args):
 # report says the result reproduced.
 
 REPORT_NAMESPACE = "research-box-report"
+LOG_NAMESPACE = "research-box-log"
+
+
+# A transparency log (RFC 9162 Merkle tree) records each signed report once, so a report
+# cannot later be back-dated or swapped. A log proof is a JSON file: {"log": origin,
+# "leaf_index", "tree_size", "inclusion": [hex hashes], "checkpoint": text,
+# "checkpoint_signature": SSH signature text}. The checkpoint is a C2SP tlog checkpoint
+# (origin, tree size and base64 root hash, one per line), signed with ssh-keygen in the
+# research-box-log namespace. The leaf is report_leaf() of the report and signature bytes.
+
+def leaf_hash(data):
+    return hashlib.sha256(b"\x00" + data).digest()
+
+
+def node_hash(left, right):
+    return hashlib.sha256(b"\x01" + left + right).digest()
+
+
+def report_leaf(report_bytes, signature_bytes):
+    return ("research-box-report/v1\n" + hashlib.sha256(report_bytes).hexdigest() + "\n"
+            + hashlib.sha256(signature_bytes).hexdigest() + "\n").encode()
+
+
+def root_from_inclusion(index, size, leaf, path):
+    """The tree root implied by an inclusion proof (RFC 9162, 2.1.3.2), or None."""
+    if not 0 <= index < size:
+        return None
+    fn, sn, r = index, size - 1, leaf
+    for p in path:
+        if sn == 0:
+            return None
+        if fn & 1 or fn == sn:
+            r = node_hash(p, r)
+            while not fn & 1 and fn != 0:
+                fn >>= 1
+                sn >>= 1
+        else:
+            r = node_hash(r, p)
+        fn >>= 1
+        sn >>= 1
+    return r if sn == 0 else None
+
+
+def check_signature(data, signature_text, signers, namespace):
+    """Verify an SSH signature (given as text) over data. Returns (status, identity or
+    reason): status 0 good, 1 bad, 2 could not check."""
+    with tempfile.TemporaryDirectory() as d:
+        sig = Path(d) / "sig"
+        sig.write_text(signature_text, encoding="utf-8", newline="\n")
+        found = ssh_keygen(["-Y", "find-principals", "-f", str(signers), "-s", str(sig)], data)
+        if found is None:
+            return 2, "ssh-keygen (OpenSSH 8.2 or later) was not found"
+        names = [n for n in found[1].splitlines() if n.strip()] if found[0] == 0 else []
+        if not names:
+            return 1, "no key in the signers file made this signature"
+        result = ssh_keygen(["-Y", "verify", "-f", str(signers), "-I", names[0],
+                             "-n", namespace, "-s", str(sig)], data)
+        if result is None:
+            return 2, "ssh-keygen (OpenSSH 8.2 or later) was not found"
+        return (0, names[0]) if result[0] == 0 else (1, f"bad signature for {names[0]}")
+
+
+def check_log_proof(proof_path, signers, report_bytes, signature_bytes):
+    """Returns (status, message): 0 included, 1 does not match, 2 could not check."""
+    try:
+        proof = json.loads(Path(proof_path).read_text(encoding="utf-8"))
+        index, size = int(proof["leaf_index"]), int(proof["tree_size"])
+        path = [bytes.fromhex(h) for h in proof["inclusion"]]
+        checkpoint, cp_sig = proof["checkpoint"], proof["checkpoint_signature"]
+        origin = proof["log"]
+    except (OSError, ValueError, KeyError, TypeError) as err:
+        return 2, f"could not read the log proof {proof_path} ({err})"
+    lines = checkpoint.split("\n")
+    if len(lines) < 4 or lines[0] != origin or lines[1] != str(size):
+        return 1, "the checkpoint does not name this log and tree size"
+    try:
+        root = base64.b64decode(lines[2], validate=True)
+    except ValueError:
+        return 1, "the checkpoint's root hash is not base64"
+    status, who = check_signature(checkpoint.encode(), cp_sig, signers, LOG_NAMESPACE)
+    if status != 0:
+        return status, f"checkpoint signature: {who}"
+    leaf = leaf_hash(report_leaf(report_bytes, signature_bytes))
+    if root_from_inclusion(index, size, leaf, path) != root:
+        return 1, "the report and signature are not in the log at that position"
+    return 0, (f"entry {index} of {size} in the log {origin}, checkpoint signed by {who}")
 
 
 def ssh_keygen(arguments, data):
@@ -567,7 +764,10 @@ def verify_report(folder, args):
         print(f"{report} is not a research-box reproduction report (no drop_id or verdict). "
               "Nothing was verified.")
         return 2
-    for path, what in ((signature, "signature"), (signers, "allowed-signers file")):
+    needed = [(signature, "signature"), (signers, "allowed-signers file")]
+    if args.log_proof is not None:
+        needed += [(args.log_proof, "log proof"), (args.log_signers, "log signers file")]
+    for path, what in needed:
         if not path.is_file():
             print(f"No {what} at {path}. Nothing was verified.")
             return 2
@@ -614,6 +814,25 @@ def verify_report(folder, args):
         return 1
     print(f"Drop: the report names this drop ({drop_id}).")
 
+    logged = None
+    if args.log_proof is not None:
+        status, message = check_log_proof(args.log_proof, args.log_signers, raw,
+                                          signature.read_bytes())
+        if status != 0:
+            print(f"Log: {message}. Not verified.")
+            return status
+        logged = message
+        print(f"Log: {message}.")
+    else:
+        print("Log: no log proof given, so nothing shows when this report was first "
+              "published; its times are the signer's word.")
+    if data.get("network"):
+        print(f"Network during the run: {data['network']}.")
+    for s in data.get("stored_values") or []:
+        if isinstance(s, dict):
+            print(f"Note: {s.get('output')} = {s.get('value')} already appears in "
+                  f"{', '.join(map(str, s.get('files') or []))}; check that it is computed.")
+
     for e in data.get("expectations") or []:
         if isinstance(e, dict):
             mark = "match " if e.get("matched") else "DIFFERS"
@@ -626,8 +845,11 @@ def verify_report(folder, args):
               f"({data['verdict']}), run {when} on {where}.")
         return 1
     print(f"Result: verified. {identity} signed a report that this drop reproduced, run "
-          f"{when} on {where}. A signature shows who vouches for the run, not that the run "
-          "was honest or the result is correct.")
+          f"{when} on {where}" + (f", logged as {logged}" if logged else "") + ". A "
+          "signature shows who vouches for the run, not that the run was honest or the "
+          "result is correct.")
+    if data.get("claim"):
+        print(f"What the report claims: {data['claim']}")
     return 0
 
 
@@ -659,6 +881,9 @@ def parse(argv):
                    help="with --reproduce: run without asking (for pipelines)")
     p.add_argument("--timeout", type=float, metavar="SECONDS",
                    help="with --reproduce: override the box's timeout")
+    p.add_argument("--no-network", action="store_true",
+                   help="with --reproduce: run the command with no network (Linux, in a new "
+                        "network namespace); refuses to run where that is not available")
     p.add_argument("--report", type=Path, metavar="FILE",
                    help="with --reproduce: write the result as JSON here (outside the drop)")
     p.add_argument("--verify-report", type=Path, metavar="REPORT",
@@ -671,19 +896,30 @@ def parse(argv):
                         "(default: whichever allowed signer's key made the signature)")
     p.add_argument("--signature", type=Path, metavar="FILE",
                    help="with --verify-report: the signature file (default: REPORT.sig)")
+    p.add_argument("--log-proof", type=Path, metavar="FILE",
+                   help="with --verify-report: a transparency-log inclusion proof for the "
+                        "report; it must verify")
+    p.add_argument("--log-signers", type=Path, metavar="FILE",
+                   help="with --log-proof: allowed_signers file of trusted log keys")
     args = p.parse_args(argv[1:])
-    verify_only = (args.allowed_signers, args.signer, args.signature)
+    verify_only = (args.allowed_signers, args.signer, args.signature, args.log_proof,
+                   args.log_signers)
     if args.verify_report is None and any(v is not None for v in verify_only):
-        p.error("--allowed-signers, --signer and --signature go with --verify-report")
+        p.error("--allowed-signers, --signer, --signature, --log-proof and --log-signers "
+                "go with --verify-report")
+    if (args.log_proof is None) != (args.log_signers is None):
+        p.error("--log-proof and --log-signers go together")
     if args.verify_report is not None:
         if args.allowed_signers is None:
             p.error("--verify-report needs --allowed-signers FILE")
         if (args.reproduce or args.check or args.out or args.strict or args.yes
-                or args.timeout is not None or args.report or args.audience != "private"):
+                or args.timeout is not None or args.report or args.no_network
+                or args.audience != "private"):
             p.error("--verify-report checks a dropped box on its own; use it without "
                     "--check, --reproduce, --for, --out or --strict")
-    if not args.reproduce and (args.yes or args.timeout is not None or args.report):
-        p.error("--yes, --timeout and --report go with --reproduce")
+    if not args.reproduce and (args.yes or args.timeout is not None or args.report
+                               or args.no_network):
+        p.error("--yes, --timeout, --no-network and --report go with --reproduce")
     if args.reproduce and (args.check or args.out or args.strict or args.audience != "private"):
         p.error("--reproduce runs on a dropped box; use it without --check, --for, --out "
                 "or --strict")

@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -632,6 +633,199 @@ class VerifyReportTests(unittest.TestCase):
         before = sorted(p.name for p in self.tmp.iterdir())
         self.assertEqual(self.verify().returncode, 0)
         self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), before)
+
+
+def write_zip(path, members):
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, data in members.items():
+            z.writestr(name, data)
+
+
+XLSX_STRINGS = ('<?xml version="1.0" encoding="UTF-8"?>'
+                '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                '<si><t>{first}</t></si><si><t>{second}</t></si></sst>')
+CORE_PROPS = ('<?xml version="1.0" encoding="UTF-8"?>'
+              '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/'
+              'metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/">'
+              '<dc:creator>{creator}</dc:creator></cp:coreProperties>')
+DOCX_BODY = ('<?xml version="1.0" encoding="UTF-8"?>'
+             '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/'
+             'main"><w:body><w:p><w:r><w:t>{a}</w:t></w:r><w:r><w:t>{b}</w:t></w:r></w:p>'
+             '</w:body></w:document>')
+
+
+class WatchWordScanTests(unittest.TestCase):
+    """Watch words in identifiers, Office files and files that cannot be scanned."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+        # one unique watch word, and no reproduce block, so only the file under test hits
+        data = json.loads((self.box / "box.json").read_text())
+        data["private_terms"] = ["Bluefin"]
+        data.pop("reproduce", None)
+        (self.box / "box.json").write_text(json.dumps(data))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def add_shareable(self, rel, content):
+        path = self.box / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content)
+        data = json.loads((self.box / "box.json").read_text())
+        data["items"].append({"item": rel, "kind": "file", "live": None,
+                              "snapshot": [rel], "sharing": "shareable"})
+        (self.box / "box.json").write_text(json.dumps(data))
+
+    def strict(self, *extra):
+        return run(self.box, "--for", "shareable", "--out", self.tmp / "share", "--strict",
+                   *extra)
+
+    def test_identifier_with_underscores_is_caught(self):
+        self.add_shareable("code/keys.py", "BLUEFIN_KEY = 1\nbluefin_mode = True\n")
+        r = self.strict()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("code/keys.py line 1", r.stderr)
+
+    def test_phrase_written_as_identifier_is_caught(self):
+        data = json.loads((self.box / "box.json").read_text())
+        data["private_terms"] = ["Project Bluefin"]
+        (self.box / "box.json").write_text(json.dumps(data))
+        self.add_shareable("code/run.py", "use_project_bluefin = False\n")
+        r = self.strict()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("code/run.py", r.stderr)
+
+    def test_longer_words_still_do_not_match(self):
+        self.add_shareable("code/fish.py", "bluefins = 2  # bluefinish\n")
+        r = self.strict()
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_watch_word_in_spreadsheet_cells_is_caught(self):
+        self.add_shareable("sheet/data.xlsx", b"")
+        write_zip(self.box / "sheet" / "data.xlsx",
+                  {"xl/sharedStrings.xml": XLSX_STRINGS.format(first="Bluefin", second="Tuna")})
+        r = self.strict()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("sheet/data.xlsx", r.stderr)
+
+    def test_watch_word_in_document_properties_is_caught(self):
+        self.add_shareable("doc/paper.docx", b"")
+        write_zip(self.box / "doc" / "paper.docx",
+                  {"word/document.xml": DOCX_BODY.format(a="Clean ", b="text."),
+                   "docProps/core.xml": CORE_PROPS.format(creator="Bluefin team")})
+        r = self.strict()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("doc/paper.docx", r.stderr)
+
+    def test_word_split_across_runs_is_caught(self):
+        self.add_shareable("doc/notes.docx", b"")
+        write_zip(self.box / "doc" / "notes.docx",
+                  {"word/document.xml": DOCX_BODY.format(a="Blue", b="fin results")})
+        self.assertEqual(self.strict().returncode, 1)
+
+    def test_clean_office_file_passes(self):
+        self.add_shareable("sheet/clean.xlsx", b"")
+        write_zip(self.box / "sheet" / "clean.xlsx",
+                  {"xl/sharedStrings.xml": XLSX_STRINGS.format(first="Blue", second="fin")})
+        r = self.strict()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Not scanned", r.stdout)
+
+    def test_unscannable_file_needs_allow_unscanned_under_strict(self):
+        self.add_shareable("doc/figure.pdf", b"%PDF-1.7\n\xe2\xe3\xcf\xd3 stream\x00\xff")
+        r = self.strict()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("could not be scanned", r.stderr)
+        self.assertIn("doc/figure.pdf", r.stderr)
+        self.assertFalse((self.tmp / "share").exists())
+        r = self.strict("--allow-unscanned")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("Not scanned for watch words", r.stdout)
+
+    def test_unscannable_file_is_only_reported_without_strict(self):
+        self.add_shareable("doc/figure.png", b"\x89PNG\r\n\x1a\n\x00\xff")
+        r = run(self.box, "--for", "shareable", "--out", self.tmp / "share")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("--strict refuses the drop", r.stdout)
+
+    def test_embedded_files_in_office_documents_count_as_unscanned(self):
+        self.add_shareable("doc/slides.pptx", b"")
+        write_zip(self.box / "doc" / "slides.pptx",
+                  {"ppt/slides/slide1.xml": DOCX_BODY.format(a="Clean", b=""),
+                   "ppt/media/image1.png": b"\x89PNG\r\n"})
+        r = self.strict()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("embedded: ppt/media/image1.png", r.stderr)
+
+    def test_broken_office_file_counts_as_unscanned(self):
+        self.add_shareable("sheet/broken.xlsx", b"not a zip file")
+        r = self.strict()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("sheet/broken.xlsx", r.stderr)
+
+    def test_allow_unscanned_needs_strict(self):
+        r = run(self.box, "--for", "shareable", "--out", self.tmp / "s", "--allow-unscanned")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("goes with --strict", r.stderr)
+
+
+class RepositoryTests(unittest.TestCase):
+    """Packaging and output conventions."""
+
+    def test_versions_agree(self):
+        skill = (ROOT / "research-box" / "SKILL.md").read_text()
+        skill_version = skill.split('version: "', 1)[1].split('"', 1)[0]
+        plugin = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
+        market = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text())
+        readme = (ROOT / "README.md").read_text()
+        latest = readme.split("## Versions", 1)[1].split("- **", 1)[1].split("**", 1)[0]
+        self.assertEqual(plugin["version"], skill_version)
+        self.assertEqual(latest, skill_version)
+        for entry in market["plugins"]:  # plugin.json is the single source of the version
+            self.assertNotIn("version", entry)
+
+    def test_plugin_icon_sits_outside_the_manifest_folder(self):
+        plugin = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
+        icon = plugin["icon"]
+        self.assertFalse(icon.lstrip("./").startswith(".claude-plugin"))
+        self.assertTrue((ROOT / icon).is_file())
+
+    def test_license_and_notice_copies_match(self):
+        for name in ("LICENSE", "NOTICE"):
+            self.assertEqual((ROOT / name).read_bytes(),
+                             (ROOT / "research-box" / name).read_bytes(), name)
+
+    def test_generated_files_use_lf_and_posix_paths(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            out = tmp / "drop"
+            r = run(EXAMPLE, "--for", "shareable", "--out", out)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            for name in ("BOX.md", "box.json", "ro-crate-metadata.json",
+                         "manifest-sha256.txt", "tagmanifest-sha256.txt"):
+                self.assertNotIn(b"\r\n", (out / name).read_bytes(), name)
+            self.assertNotIn("\\", (out / "manifest-sha256.txt").read_text())
+            self.assertEqual(run(out, "--check").returncode, 0)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_non_empty_out_folder_is_refused(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            out = tmp / "drop"
+            out.mkdir()
+            (out / "leftover.txt").write_text("from an earlier, wider drop")
+            r = run(EXAMPLE, "--for", "shareable", "--out", out)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("is not empty", r.stderr)
+        finally:
+            shutil.rmtree(tmp)
 
 
 if __name__ == "__main__":

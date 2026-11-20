@@ -470,14 +470,19 @@ def network_wrapper():
     exe = shutil.which("unshare")
     if not sys.platform.startswith("linux") or exe is None:
         return None
-    prefix = [exe, "--map-root-user", "--net", "--"]
-    try:
-        probe = subprocess.run(prefix + [sys.executable, "-c", ""], stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return prefix if probe.returncode == 0 else None
+    # With its own process namespace too, anything the command leaves running is killed
+    # when the command ends, so it cannot touch the report afterwards.
+    for prefix in ([exe, "--map-root-user", "--net", "--pid", "--fork", "--"],
+                   [exe, "--map-root-user", "--net", "--"]):
+        try:
+            probe = subprocess.run(prefix + [sys.executable, "-c", ""],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode == 0:
+            return prefix
+    return None
 
 
 def reproduce(folder, args):
@@ -644,6 +649,7 @@ def reproduce(folder, args):
 # report says the result reproduced.
 
 REPORT_NAMESPACE = "research-box-report"
+RERUN_WORKFLOW = ".github/workflows/rerun.yml"
 LOG_NAMESPACE = "research-box-log"
 
 
@@ -764,7 +770,11 @@ def verify_report(folder, args):
         print(f"{report} is not a research-box reproduction report (no drop_id or verdict). "
               "Nothing was verified.")
         return 2
-    needed = [(signature, "signature"), (signers, "allowed-signers file")]
+    attested = getattr(args, "attested_by", None)
+    if attested:
+        needed = [(args.bundle, "attestation bundle")] if args.bundle else []
+    else:
+        needed = [(signature, "signature"), (signers, "allowed-signers file")]
     if args.log_proof is not None:
         needed += [(args.log_proof, "log proof"), (args.log_signers, "log signers file")]
     for path, what in needed:
@@ -778,6 +788,13 @@ def verify_report(folder, args):
         print("The drop does not match its manifests, so the report cannot be about these "
               "files. Not verified.")
         return status
+
+    if attested:
+        status, identity = check_attestation(report, attested, args.bundle)
+        if status != 0:
+            return status
+        logged = "an entry in the Sigstore public transparency log"
+        return finish_verify(folder, data, raw, identity, logged, args, signature=None)
 
     sig = str(signature)
     identity = args.signer
@@ -806,7 +823,39 @@ def verify_report(folder, args):
               "signed it. Not verified.")
         return 1
     print(f"Signature: good, by {identity}.")
+    return finish_verify(folder, data, raw, identity, None, args, signature)
 
+
+def check_attestation(report, repo, bundle):
+    """Check with the GitHub CLI that the rerun workflow of REPO attested to this exact
+    report file. Returns (status, identity)."""
+    workflow = f"{repo}/{RERUN_WORKFLOW}"
+    exe = shutil.which("gh")
+    if exe is None:
+        print("The GitHub CLI (gh) is needed to check a GitHub attestation and was not "
+              "found. Nothing was verified.")
+        return 2, None
+    command = [exe, "attestation", "verify", str(report), "--repo", repo,
+               "--signer-workflow", workflow]
+    if bundle:
+        command += ["--bundle", str(bundle)]
+    try:
+        proc = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        print(f"gh attestation verify could not run ({err}). Nothing was verified.")
+        return 2, None
+    if proc.returncode != 0:
+        tail = proc.stdout.decode("utf-8", errors="replace").strip().splitlines()[-3:]
+        print(f"No valid attestation by {workflow} for this exact report file. Not verified."
+              + ("\n  " + "\n  ".join(tail) if tail else ""))
+        return 1, None
+    identity = f"the GitHub Actions workflow {workflow}"
+    print(f"Attestation: good, by {identity}.")
+    return 0, identity
+
+
+def finish_verify(folder, data, raw, identity, logged, args, signature):
     drop_id = "sha256:" + sha256(folder / "tagmanifest-sha256.txt")
     if data["drop_id"] != drop_id:
         print(f"The report is about another drop ({data['drop_id']}); this drop is "
@@ -814,8 +863,9 @@ def verify_report(folder, args):
         return 1
     print(f"Drop: the report names this drop ({drop_id}).")
 
-    logged = None
-    if args.log_proof is not None:
+    if logged is not None:
+        print(f"Log: {logged}.")
+    elif args.log_proof is not None:
         status, message = check_log_proof(args.log_proof, args.log_signers, raw,
                                           signature.read_bytes())
         if status != 0:
@@ -901,6 +951,13 @@ def parse(argv):
                         "report; it must verify")
     p.add_argument("--log-signers", type=Path, metavar="FILE",
                    help="with --log-proof: allowed_signers file of trusted log keys")
+    p.add_argument("--attested-by", metavar="OWNER/REPO",
+                   help="with --verify-report: instead of an SSH signature, check with the "
+                        "GitHub CLI that this repository's rerun workflow attested to the "
+                        "report (a GitHub Actions rerun)")
+    p.add_argument("--bundle", type=Path, metavar="FILE",
+                   help="with --attested-by: the attestation bundle on disk (default: "
+                        "fetch it from GitHub)")
     args = p.parse_args(argv[1:])
     verify_only = (args.allowed_signers, args.signer, args.signature, args.log_proof,
                    args.log_signers)
@@ -909,9 +966,20 @@ def parse(argv):
                 "go with --verify-report")
     if (args.log_proof is None) != (args.log_signers is None):
         p.error("--log-proof and --log-signers go together")
+    if args.bundle is not None and args.attested_by is None:
+        p.error("--bundle goes with --attested-by")
+    if args.attested_by is not None and args.verify_report is None:
+        p.error("--attested-by goes with --verify-report")
+    if args.attested_by is not None and any(v is not None for v in verify_only):
+        p.error("--attested-by replaces --allowed-signers, --signer, --signature, "
+                "--log-proof and --log-signers; the attestation's log is Sigstore's")
+    if args.attested_by is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+",
+                                                         args.attested_by):
+        p.error("--attested-by takes OWNER/REPO, for example PaoloTCS/research-box")
     if args.verify_report is not None:
-        if args.allowed_signers is None:
-            p.error("--verify-report needs --allowed-signers FILE")
+        if args.allowed_signers is None and args.attested_by is None:
+            p.error("--verify-report needs --allowed-signers FILE or --attested-by "
+                    "OWNER/REPO")
         if (args.reproduce or args.check or args.out or args.strict or args.yes
                 or args.timeout is not None or args.report or args.no_network
                 or args.audience != "private"):

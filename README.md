@@ -9,6 +9,7 @@ Say "make a box called prime-numbers", "add this sheet to the box", "drop the bo
 - **Sharing levels:** private, same assistant, shareable. A drop for wider readers leaves out what is not cleared for them, writes a clean copy that holds nothing else, and says what it left out.
 - **Checks:** `--check` tells you whether any file in a drop, including its own description, changed or was copied stale, and a list of watch words flags private terms that are about to leave in a shareable drop.
 - **Reproduce:** a box can declare one command and what its output should be. Whoever opens the drop runs `--reproduce`: it checks the checksums, asks, runs the command on a temporary copy and reports whether the result reproduced, with numbers compared within stated tolerances or bounds.
+- **Signed reproductions:** whoever reproduced a box can sign the JSON report with an SSH key, and `--verify-report` checks, without running anything, that a trusted key signed a report saying this exact drop reproduced.
 
 ## Quick demo
 
@@ -72,7 +73,7 @@ tests/test_build_box.py        unittest suite, standard library only
 
 ## Try it
 
-The commands and the output in [Quick demo](#quick-demo) were run against this revision. To run the 43-test suite:
+The commands and the output in [Quick demo](#quick-demo) were run against this revision. To run the 57-test suite (the 11 signature tests need `ssh-keygen` and are skipped without it):
 
 ```
 python3 -m unittest discover tests
@@ -102,8 +103,11 @@ The skill tells the agent to run `research-box/scripts/build_box.py`, a Python s
 
 The one exception is `--reproduce`, which runs the command a box declares, and only after you confirm it. That command is the box author's code: it runs with your permissions on a temporary copy of the drop and can do anything you can, including use the network. Opening a box never runs it. For a box from someone you do not know, run it in a container or virtual machine.
 
+`--verify-report` runs nothing from the box. It calls the local `ssh-keygen` to check a signature and makes no network calls.
+
 ## Versions
 
+- **0.4.0** (November 20, 2026): signed reproduction reports. `--verify-report` checks a `--report` file signed with an SSH key (`ssh-keygen -Y sign -n research-box-report`) against an OpenSSH `allowed_signers` file: the drop must match its manifests, the signature must verify, the report must name this exact drop and say it reproduced. It runs nothing from the box; exit 0 verified, 1 does not match, 2 could not check. 57 tests.
 - **0.3.0** (November 20, 2026): reproduce on open. A box can declare one command (`reproduce` in `box.json`) and its expected output: exact bytes, exact text, or named numbers with tolerances and bounds. `--reproduce` runs `--check` first, shows the command and asks before running it on a temporary copy, without a shell and with a minimal environment and a timeout, then reports reproduced or not; `--report` writes the result as JSON. Drops refuse a reproduce command with a path outside the box or one that needs a file the drop does not hold, and record it in the RO-Crate metadata as a `CreateAction`. 43 tests.
 - **0.2.5** (November 19, 2026), from the first real user's bug report: watch words match whole words and phrases, not substrings, so a short private term no longer matches inside ordinary words such as "file" and blocks every strict drop; each hit is reported with its file, line and context; held-back state lines and box details are reported like held-back items. 27 tests.
 - **0.2.4** (November 19, 2026): packaged as a Claude Code plugin (`.claude-plugin/plugin.json` and a one-plugin marketplace), with an icon and a note on what the script runs. No change to the skill or the script.

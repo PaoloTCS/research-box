@@ -5,6 +5,8 @@ Usage:
   python3 build_box.py <box-folder> [--for shareable|same-assistant|private] [--out <folder>] [--strict]
   python3 build_box.py <box-folder> --check
   python3 build_box.py <dropped-box> --reproduce [--yes] [--timeout SECONDS] [--report FILE]
+  python3 build_box.py <dropped-box> --verify-report REPORT --allowed-signers FILE
+                       [--signer IDENTITY] [--signature FILE]
   python3 build_box.py --help
 
 Reads <box-folder>/box.json (format in references/box-format.md). Standard library only.
@@ -33,6 +35,15 @@ Reads <box-folder>/box.json (format in references/box-format.md). Standard libra
           JSON outside the drop. Exit status: 0 = reproduced, 1 = did not reproduce (or the
           drop does not match its manifests), 2 = not run or inconclusive (no reproduce
           block, no manifest, declined, could not start, or timed out).
+
+--verify-report
+          Check a --report file that someone signed with an SSH key (ssh-keygen -Y sign -n
+          research-box-report REPORT, which writes REPORT.sig). Runs nothing from the box.
+          It checks the drop against its manifests, the signature against an OpenSSH
+          allowed_signers file (--allowed-signers) using the local ssh-keygen, that the
+          report names this drop (drop_id), and that its verdict is reproduced. Exit status:
+          0 verified, 1 a signature, drop, file or verdict does not match, 2 could not check
+          (no manifests, unreadable report, no signature file, or no ssh-keygen).
 
 A drop is also refused, writing nothing, when a snapshot path leaves the box folder, a
 declared snapshot file is missing, one file is listed under items with different levels, or
@@ -454,6 +465,112 @@ def reproduce(folder, args):
     return code
 
 
+# ---------------------------------------------------------------------------------------
+# Signed reproduction reports: anyone who ran --reproduce can sign the --report file with
+# an SSH key (ssh-keygen -Y sign -n research-box-report). --verify-report checks, without
+# running anything, that the signature verifies against an allowed-signers file, that the
+# report is about this exact drop, that the drop still matches its manifests, and that the
+# report says the result reproduced.
+
+REPORT_NAMESPACE = "research-box-report"
+
+
+def ssh_keygen(arguments, data):
+    """Run the local ssh-keygen with data on stdin. Returns (status, output) or None when
+    ssh-keygen is not installed."""
+    exe = shutil.which("ssh-keygen")
+    if exe is None:
+        return None
+    proc = subprocess.run([exe, *arguments], input=data, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, shell=False)
+    return proc.returncode, proc.stdout.decode("utf-8", errors="replace").strip()
+
+
+def verify_report(folder, args):
+    """Check a signed reproduction report against a drop. Exit status:
+    0 a valid signature from an allowed signer on a report that this exact drop reproduced,
+    and the drop still matches its manifests; 1 something does not match (signature, drop,
+    files or verdict); 2 the check could not be made (no manifests, unreadable report,
+    no signature file or no ssh-keygen)."""
+    folder = Path(folder)
+    report = args.verify_report
+    signature = args.signature or Path(str(report) + ".sig")
+    signers = args.allowed_signers
+
+    try:
+        raw = report.read_bytes()
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as err:
+        print(f"Could not read the report {report} ({err}). Nothing was verified.")
+        return 2
+    if not isinstance(data, dict) or not all(k in data for k in ("drop_id", "verdict")):
+        print(f"{report} is not a research-box reproduction report (no drop_id or verdict). "
+              "Nothing was verified.")
+        return 2
+    for path, what in ((signature, "signature"), (signers, "allowed-signers file")):
+        if not path.is_file():
+            print(f"No {what} at {path}. Nothing was verified.")
+            return 2
+
+    print("Checking the drop against its manifests first.")
+    status = check(folder)
+    if status != 0:
+        print("The drop does not match its manifests, so the report cannot be about these "
+              "files. Not verified.")
+        return status
+
+    sig = str(signature)
+    identity = args.signer
+    if identity is None:
+        found = ssh_keygen(["-Y", "find-principals", "-f", str(signers), "-s", sig], raw)
+        if found is None:
+            print("ssh-keygen (OpenSSH 8.2 or later) is needed to check signatures and was "
+                  "not found. Nothing was verified.")
+            return 2
+        code, out = found
+        principals = [p for p in out.splitlines() if p.strip()] if code == 0 else []
+        if not principals:
+            print("The signature was not made by any key in the allowed-signers file. "
+                  "Not verified.")
+            return 1
+        identity = principals[0]
+    result = ssh_keygen(["-Y", "verify", "-f", str(signers), "-I", identity,
+                         "-n", REPORT_NAMESPACE, "-s", sig], raw)
+    if result is None:
+        print("ssh-keygen (OpenSSH 8.2 or later) is needed to check signatures and was not "
+              "found. Nothing was verified.")
+        return 2
+    if result[0] != 0:
+        print(f"The signature does not verify for {identity} with namespace "
+              f"{REPORT_NAMESPACE}: the report was changed after signing, or another key "
+              "signed it. Not verified.")
+        return 1
+    print(f"Signature: good, by {identity}.")
+
+    drop_id = "sha256:" + sha256(folder / "tagmanifest-sha256.txt")
+    if data["drop_id"] != drop_id:
+        print(f"The report is about another drop ({data['drop_id']}); this drop is "
+              f"{drop_id}. Not verified.")
+        return 1
+    print(f"Drop: the report names this drop ({drop_id}).")
+
+    for e in data.get("expectations") or []:
+        if isinstance(e, dict):
+            mark = "match " if e.get("matched") else "DIFFERS"
+            print(f"  {mark}  {e.get('output')}: expected {e.get('expected')}; "
+                  f"observed {e.get('observed')}")
+    when = data.get("started", "an unrecorded time")
+    where = data.get("platform", "an unrecorded platform")
+    if data["verdict"] != "reproduced":
+        print(f"Result: the signed report says this drop did not reproduce "
+              f"({data['verdict']}), run {when} on {where}.")
+        return 1
+    print(f"Result: verified. {identity} signed a report that this drop reproduced, run "
+          f"{when} on {where}. A signature shows who vouches for the run, not that the run "
+          "was honest or the result is correct.")
+    return 0
+
+
 def parse(argv):
     p = argparse.ArgumentParser(
         prog="build_box.py",
@@ -481,7 +598,27 @@ def parse(argv):
                    help="with --reproduce: override the box's timeout")
     p.add_argument("--report", type=Path, metavar="FILE",
                    help="with --reproduce: write the result as JSON here (outside the drop)")
+    p.add_argument("--verify-report", type=Path, metavar="REPORT",
+                   help="check a signed --report file against this drop without running "
+                        "anything; exit 0 verified, 1 does not match, 2 could not check")
+    p.add_argument("--allowed-signers", type=Path, metavar="FILE",
+                   help="with --verify-report: OpenSSH allowed_signers file of trusted keys")
+    p.add_argument("--signer", metavar="IDENTITY",
+                   help="with --verify-report: the identity expected to have signed "
+                        "(default: whichever allowed signer's key made the signature)")
+    p.add_argument("--signature", type=Path, metavar="FILE",
+                   help="with --verify-report: the signature file (default: REPORT.sig)")
     args = p.parse_args(argv[1:])
+    verify_only = (args.allowed_signers, args.signer, args.signature)
+    if args.verify_report is None and any(v is not None for v in verify_only):
+        p.error("--allowed-signers, --signer and --signature go with --verify-report")
+    if args.verify_report is not None:
+        if args.allowed_signers is None:
+            p.error("--verify-report needs --allowed-signers FILE")
+        if (args.reproduce or args.check or args.out or args.strict or args.yes
+                or args.timeout is not None or args.report or args.audience != "private"):
+            p.error("--verify-report checks a dropped box on its own; use it without "
+                    "--check, --reproduce, --for, --out or --strict")
     if not args.reproduce and (args.yes or args.timeout is not None or args.report):
         p.error("--yes, --timeout and --report go with --reproduce")
     if args.reproduce and (args.check or args.out or args.strict or args.audience != "private"):
@@ -499,6 +636,8 @@ def main(argv):
         sys.exit(check(folder))
     if args.reproduce:
         sys.exit(reproduce(folder, args))
+    if args.verify_report is not None:
+        sys.exit(verify_report(folder, args))
     audience, out = args.audience, args.out
     if not (folder / "box.json").is_file():
         sys.exit(f"No box.json in {folder}.")

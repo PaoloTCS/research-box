@@ -468,5 +468,171 @@ class ReproduceTests(unittest.TestCase):
         self.assertIn("go with --reproduce", r.stderr)
 
 
+SSH_KEYGEN = shutil.which("ssh-keygen")
+
+
+def run_env(*args, env=None):
+    return subprocess.run([sys.executable, str(SCRIPT), *map(str, args)],
+                          capture_output=True, text=True, env=env)
+
+
+class VerifyReportOptionTests(unittest.TestCase):
+    """--verify-report command line; needs no ssh-keygen."""
+
+    def test_verify_options_need_verify_report(self):
+        r = run(EXAMPLE, "--signer", "alice")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("go with --verify-report", r.stderr)
+
+    def test_verify_report_needs_allowed_signers(self):
+        r = run(EXAMPLE, "--verify-report", "report.json")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("needs --allowed-signers", r.stderr)
+
+    def test_verify_report_stands_alone(self):
+        r = run(EXAMPLE, "--verify-report", "r.json", "--allowed-signers", "s", "--check")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("on its own", r.stderr)
+
+
+@unittest.skipUnless(SSH_KEYGEN, "ssh-keygen (OpenSSH 8.2 or later) is not installed")
+class VerifyReportTests(unittest.TestCase):
+    """Signed reproduction reports: signature, drop, files and verdict must all match."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+        self.saved_tmpdir = os.environ.get("TMPDIR")
+        os.environ["TMPDIR"] = str(self.tmp)
+        self.out = self.tmp / "drop"
+        r = run(self.box, "--for", "shareable", "--out", self.out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.report = self.tmp / "report.json"
+        r = run(self.out, "--reproduce", "--yes", "--report", self.report)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.signers = self.tmp / "allowed_signers"
+        self.alice = self.key("alice")
+        self.add_signer("alice@example.org", self.alice)
+
+    def tearDown(self):
+        if self.saved_tmpdir is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = self.saved_tmpdir
+        shutil.rmtree(self.tmp)
+
+    def key(self, name):
+        path = self.tmp / f"key_{name}"
+        subprocess.run([SSH_KEYGEN, "-q", "-t", "ed25519", "-N", "", "-C", name,
+                        "-f", str(path)], check=True)
+        return path
+
+    def add_signer(self, identity, key):
+        public = (key.parent / (key.name + ".pub")).read_text().split()[:2]
+        with open(self.signers, "a") as f:
+            f.write(f'{identity} namespaces="research-box-report" {" ".join(public)}\n')
+
+    def sign(self, key, report=None, namespace="research-box-report"):
+        report = report or self.report
+        sig = Path(str(report) + ".sig")
+        if sig.exists():
+            sig.unlink()
+        subprocess.run([SSH_KEYGEN, "-q", "-Y", "sign", "-f", str(key), "-n", namespace,
+                        str(report)], check=True, capture_output=True)
+        return sig
+
+    def verify(self, *extra, folder=None, env=None):
+        return run_env(folder or self.out, "--verify-report", self.report,
+                       "--allowed-signers", self.signers, *extra, env=env)
+
+    def test_signed_report_verifies(self):
+        self.sign(self.alice)
+        r = self.verify()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("Signature: good, by alice@example.org", r.stdout)
+        self.assertIn("Result: verified.", r.stdout)
+
+    def test_named_signer_must_match(self):
+        self.sign(self.alice)
+        self.assertEqual(self.verify("--signer", "alice@example.org").returncode, 0)
+        r = self.verify("--signer", "bob@example.org")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("does not verify", r.stdout)
+
+    def test_report_edited_after_signing_fails(self):
+        self.sign(self.alice)
+        data = json.loads(self.report.read_text())
+        data["platform"] = "somewhere else"
+        self.report.write_text(json.dumps(data, indent=2) + "\n")
+        r = self.verify()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Not verified", r.stdout)
+
+    def test_unknown_key_fails(self):
+        self.sign(self.key("mallory"))
+        r = self.verify()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not made by any key", r.stdout)
+
+    def test_other_namespace_fails(self):
+        self.sign(self.alice, namespace="file")
+        r = self.verify("--signer", "alice@example.org")
+        self.assertEqual(r.returncode, 1)
+
+    def test_report_about_another_drop_fails(self):
+        self.sign(self.alice)
+        data = json.loads((self.box / "box.json").read_text())
+        data["public"]["description"] = "A later version of the box."
+        (self.box / "box.json").write_text(json.dumps(data))
+        other = self.tmp / "drop2"
+        r = run(self.box, "--for", "shareable", "--out", other)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        r = self.verify(folder=other)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("about another drop", r.stdout)
+
+    def test_edited_drop_fails_before_the_signature(self):
+        self.sign(self.alice)
+        target = next(p for p in self.out.rglob("*.csv"))
+        target.write_text(target.read_text() + "1,2\n")
+        r = self.verify()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("does not match its manifests", r.stdout)
+        self.assertNotIn("Signature:", r.stdout)
+
+    def test_signed_failure_is_not_verified(self):
+        data = json.loads(self.report.read_text())
+        data["verdict"] = "did not reproduce"
+        self.report.write_text(json.dumps(data, indent=2) + "\n")
+        self.sign(self.alice)
+        r = self.verify()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("did not reproduce", r.stdout)
+
+    def test_missing_signature_or_report_cannot_be_checked(self):
+        r = self.verify()  # nothing signed yet
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("No signature", r.stdout)
+        self.sign(self.alice)
+        self.report.write_text("not json")
+        self.assertEqual(self.verify().returncode, 2)
+
+    def test_without_ssh_keygen_it_cannot_check(self):
+        self.sign(self.alice)
+        empty = self.tmp / "no-tools"
+        empty.mkdir()
+        env = dict(os.environ, PATH=str(empty))
+        r = self.verify(env=env)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("ssh-keygen", r.stdout)
+
+    def test_verifying_runs_nothing(self):
+        self.sign(self.alice)
+        before = sorted(p.name for p in self.tmp.iterdir())
+        self.assertEqual(self.verify().returncode, 0)
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), before)
+
+
 if __name__ == "__main__":
     unittest.main()

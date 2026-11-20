@@ -254,7 +254,7 @@ VALUES_SCRIPT = """import json, sys
 data = json.load(open("data/params.json"))
 out = {"mean_stretch": 2.8412, "false_promotions": 7, "rows": [{"n": data["n"]}]}
 json.dump(out, open("out.json", "w"))
-open("out.txt", "w").write("table\\n")
+open("out.txt", "w", newline="\\n").write("table\\n")
 print(json.dumps(out))
 """
 

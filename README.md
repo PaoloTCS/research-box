@@ -8,6 +8,7 @@ Say "make a box called prime-numbers", "add this sheet to the box", "drop the bo
 - **Snapshot layer:** a dropped folder with exported files, a readable `BOX.md`, an RO-Crate 1.1 `ro-crate-metadata.json`, and SHA-256 checksums of every file.
 - **Sharing levels:** private, same assistant, shareable. A drop for wider readers leaves out what is not cleared for them, writes a clean copy that holds nothing else, and says what it left out.
 - **Checks:** `--check` tells you whether any file in a drop, including its own description, changed or was copied stale, and a list of watch words flags private terms that are about to leave in a shareable drop.
+- **Reproduce:** a box can declare one command and what its output should be. Whoever opens the drop runs `--reproduce`: it checks the checksums, asks, runs the command on a temporary copy and reports whether the result reproduced, with numbers compared within stated tolerances or bounds.
 
 ## Quick demo
 
@@ -32,6 +33,26 @@ Changed since the last drop: sheet/results.csv
 
 `--check` exits 0 when the drop matches its manifests and 1 after the edit. Add `--strict` to the first command and the drop is refused until the watch word is removed.
 
+The example box also declares a reproduce command. On a fresh drop (`--yes` skips the question it otherwise asks before running anything):
+
+```
+$ python3 research-box/scripts/build_box.py /tmp/prime-share --reproduce --yes
+Checking the drop against its manifests first.
+All files match the manifest.
+
+Reproduce: Toy stretch run
+  Command:  python3 code/simulate.py
+  Runs in:  a temporary copy of /tmp/prime-share
+  Timeout:  60 seconds
+  Requires: Python 3, standard library only
+  Expects:  stdout: the text '[487, 267]'
+This runs the box's own code with your permissions. It is not a sandbox: the code can read and write your files and use the network. Run boxes from people you do not know in a container or virtual machine.
+  match   stdout (text): expected [487, 267]; observed [487, 267]
+Result: reproduced. The run's files are in /tmp/research-box-run-w62ponp5/box.
+```
+
+It exits 0 when every expected output matches, 1 when one differs, and 2 when nothing was run. `--report <file>` writes the result as JSON that an outside reproducer can send back to the author.
+
 ## Contents
 
 ```
@@ -51,13 +72,13 @@ tests/test_build_box.py        unittest suite, standard library only
 
 ## Try it
 
-The commands and the output in [Quick demo](#quick-demo) were run against this revision. To run the 27-test suite:
+The commands and the output in [Quick demo](#quick-demo) were run against this revision. To run the 43-test suite:
 
 ```
 python3 -m unittest discover tests
 ```
 
-The example box has one item at each sharing level and a watch word left in a shareable file, so each safeguard shows. The tests cover the drop rules, labels, path containment, watch words and the check's exit status.
+The example box has one item at each sharing level and a watch word left in a shareable file, so each safeguard shows. The tests cover the drop rules, labels, path containment, watch words, the check's exit status and reproduce.
 
 Manifests can also be verified without the script: `shasum -a 256 -c manifest-sha256.txt`.
 
@@ -79,8 +100,11 @@ In Claude Code, the repository is also a plugin marketplace, so the skill instal
 
 The skill tells the agent to run `research-box/scripts/build_box.py`, a Python script that uses the standard library only. It reads and writes files in the box folder you name and in the `--out` folder, and nothing else. It makes no network calls, sends nothing anywhere, and never deletes files. The live links a box lists are opened by the agent with its own tools, not by the script.
 
+The one exception is `--reproduce`, which runs the command a box declares, and only after you confirm it. That command is the box author's code: it runs with your permissions on a temporary copy of the drop and can do anything you can, including use the network. Opening a box never runs it. For a box from someone you do not know, run it in a container or virtual machine.
+
 ## Versions
 
+- **0.3.0** (November 20, 2026): reproduce on open. A box can declare one command (`reproduce` in `box.json`) and its expected output: exact bytes, exact text, or named numbers with tolerances and bounds. `--reproduce` runs `--check` first, shows the command and asks before running it on a temporary copy, without a shell and with a minimal environment and a timeout, then reports reproduced or not; `--report` writes the result as JSON. Drops refuse a reproduce command with a path outside the box or one that needs a file the drop does not hold, and record it in the RO-Crate metadata as a `CreateAction`. 43 tests.
 - **0.2.5** (November 19, 2026), from the first real user's bug report: watch words match whole words and phrases, not substrings, so a short private term no longer matches inside ordinary words such as "file" and blocks every strict drop; each hit is reported with its file, line and context; held-back state lines and box details are reported like held-back items. 27 tests.
 - **0.2.4** (November 19, 2026): packaged as a Claude Code plugin (`.claude-plugin/plugin.json` and a one-plugin marketplace), with an icon and a note on what the script runs. No change to the skill or the script.
 - **0.2.3** (November 19, 2026), after a third outside review: state-line labels survive repeated exports; fields outside the format are never copied into a drop; a missing declared snapshot, or one file listed under two sharing levels, refuses the drop; `--check` returns 2 (incomplete) without a tag manifest; watch words are scanned in every generated file, and `--strict` refuses a shareable drop that contains them; clearer wording on what checksums do and do not prove. 23 tests.

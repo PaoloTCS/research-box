@@ -5,7 +5,7 @@ license: Apache-2.0
 metadata:
   author: Paolo Pignatelli
   developed-with: Claude (Anthropic)
-  version: "0.5.0"
+  version: "0.5.1"
 ---
 
 # Research boxes

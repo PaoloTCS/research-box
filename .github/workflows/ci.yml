@@ -16,8 +16,8 @@ jobs:
         python: ["3.10", "3.12", "3.14"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Make python3 available on Windows
@@ -25,7 +25,9 @@ jobs:
         shell: pwsh
         run: |
           $py = (Get-Command python).Source
-          Copy-Item $py (Join-Path (Split-Path $py) "python3.exe")
+          $py3 = Join-Path (Split-Path $py) "python3.exe"
+          if (-not (Test-Path $py3)) { Copy-Item $py $py3 }
+          python3 --version
       - name: Unit tests
         run: python -m unittest discover tests -v
       - name: Example drop, check and reproduce

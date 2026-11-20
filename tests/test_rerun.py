@@ -115,6 +115,7 @@ class RerunTests(unittest.TestCase):
         entries = json.loads((site / "index.json").read_text())
         self.assertEqual(entries[0]["path"], "r/7/")
         self.assertIn("r/7/certificate.html", (site / "index.html").read_text())
+        self.assertIn("Content-Security-Policy", (site / "_headers").read_text())
 
     def test_unpack_takes_a_drop_and_refuses_links(self):
         good = self.tmp / "good.tar.gz"

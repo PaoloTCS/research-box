@@ -31,6 +31,15 @@ def main(argv):
         "through Sigstore.</p><table><tr><th>Box</th><th>Verdict</th><th>Run</th></tr>"
         f"{rows}</table><p><small>research-box is built with Claude, by Anthropic. Anthropic "
         "does not run or endorse these reruns.</small></p>\n", encoding="utf-8")
+    # Cloudflare Pages reads _headers: no scripts or outside resources on these pages, and
+    # the JSON files readable from anywhere so other tools can fetch a report.
+    (site / "_headers").write_text(
+        "/*\n"
+        "  X-Content-Type-Options: nosniff\n"
+        "  Referrer-Policy: no-referrer\n"
+        "  Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\n"
+        "/*.json\n"
+        "  Access-Control-Allow-Origin: *\n", encoding="utf-8")
     print(f"{len(entries)} reruns indexed.")
 
 

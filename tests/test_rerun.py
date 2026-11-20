@@ -241,6 +241,8 @@ class RequestTests(unittest.TestCase):
             base = {"BODY": form() if body is None else body, "ISSUE": "7", "AUTHOR": "alice",
                     "EVENT_ACTION": "opened", "AUTHOR_CREATED": "2020-01-01T00:00:00Z",
                     "RUNS_TODAY": "0", "PATH": os.environ.get("PATH", "")}
+            # Windows Python 3.10 cannot start without SYSTEMROOT (it seeds its hash from it).
+            base.update({k: os.environ[k] for k in ("SYSTEMROOT", "SystemRoot") if k in os.environ})
             base.update(env)
             out = run(REQUEST, "--author-issues", tmp / "issues.json",
                       "--comment", tmp / "comment.md", env=base)

@@ -17,6 +17,14 @@
     "topics": ["primes", "addressing"]
   },
   "private_terms": ["Project Lantern"],
+  "reproduce": {
+    "name": "Toy stretch run",
+    "command": ["python3", "code/simulate.py"],
+    "requires": "Python 3, standard library only",
+    "timeout_seconds": 60,
+    "sharing": "shareable",
+    "expect": [{"source": "stdout", "match": "text", "value": "[487, 267]"}]
+  },
   "items": [
     {"item": "Working notes", "kind": "document", "live": "https://example.com/notes",
      "revision": 7, "snapshot": ["doc/working-notes.md"], "sharing": "same-assistant"},

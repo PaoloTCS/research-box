@@ -101,7 +101,7 @@ In Claude Code, the repository is also a plugin marketplace, so the skill instal
 
 ## What it runs
 
-The skill tells the agent to run `research-box/scripts/build_box.py`, a Python script that uses the standard library only. It reads and writes files in the box folder you name and in the `--out` folder, and nothing else. It makes no network calls, sends nothing anywhere, and never deletes files. The live links a box lists are opened by the agent with its own tools, not by the script.
+The skill tells the agent to run `research-box/scripts/build_box.py`, a Python script that uses the standard library only. It reads and writes files in the box folder you name and in the `--out` folder, and nothing else. It sends nothing anywhere and never deletes files. It makes no network calls unless you ask for a link check: `--pin-links` and `--check-links` fetch the public web pages a box's items link to (plain GET requests, nothing sent but the request) to record or compare their SHA-256. The live links a box lists are opened by the agent with its own tools, not by the script.
 
 The one exception is `--reproduce`, which runs the command a box declares, and only after you confirm it. That command is the box author's code: it runs with your permissions on a temporary copy of the drop and can do anything you can, including use the network. Opening a box never runs it. For a box from someone you do not know, run it in a container or virtual machine. On Linux, `--no-network` runs it through `unshare` in a network namespace with no network; that cuts off the network, not your files.
 

@@ -1470,6 +1470,174 @@ class ProvenanceSignatureTests(unittest.TestCase):
         self.assertEqual(self.verify().returncode, 2)
 
 
+class PageServer:
+    """A local web server whose pages a test can change or remove."""
+
+    def __init__(self):
+        import http.server
+        import threading
+        pages = self.pages = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = pages.get(self.path)
+                if body is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def local_env():
+    """The environment for a run that fetches pages from the local server, never a proxy."""
+    env = dict(os.environ)
+    for name in ("no_proxy", "NO_PROXY"):
+        env[name] = ",".join(filter(None, [env.get(name), "127.0.0.1", "localhost"]))
+    return env
+
+
+class LinkPinTests(unittest.TestCase):
+    """--pin-links and --check-links: pinned live pages that changed or went away."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+        self.web = PageServer()
+        self.web.pages["/notes"] = b"notes, version 1\n"
+        self.web.pages["/results"] = b"n,stretch\n1,2.84\n"
+        data = json.loads((self.box / "box.json").read_text())
+        for it in data["items"]:
+            if it["live"]:
+                it["live"] = it["live"].replace("https://example.com", self.web.base)
+        data["items"][3]["live"] = None  # the planning chat: a link with nothing to fetch
+        (self.box / "box.json").write_text(json.dumps(data))
+        self.env = local_env()
+
+    def tearDown(self):
+        self.web.close()
+        shutil.rmtree(self.tmp)
+
+    def run_local(self, *args):
+        return run_env(*args, env=self.env)
+
+    def items(self, folder=None):
+        return json.loads(((folder or self.box) / "box.json").read_text())["items"]
+
+    def test_pin_records_each_pages_digest(self):
+        r = self.run_local(self.box, "--pin-links")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        items = self.items()
+        self.assertEqual(items[0]["live_sha256"],
+                         hashlib.sha256(b"notes, version 1\n").hexdigest())
+        self.assertEqual(items[1]["live_sha256"],
+                         hashlib.sha256(b"n,stretch\n1,2.84\n").hexdigest())
+        self.assertRegex(items[0]["live_pinned"], r"^\d{4}-\d{2}-\d{2}$")
+        self.assertNotIn("live_sha256", items[2])
+        self.assertIn("Drop the box again", r.stdout)
+
+    def test_unchanged_pages_pass(self):
+        self.run_local(self.box, "--pin-links")
+        out = self.tmp / "drop"
+        self.assertEqual(run(self.box, "--for", "shareable", "--out", out).returncode, 0)
+        r = self.run_local(out, "--check-links")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("unchanged    Results table", r.stdout)
+        self.assertIn("Result: 1 unchanged, 0 changed, 0 unreachable", r.stdout)
+
+    def test_changed_and_missing_pages_are_reported(self):
+        self.run_local(self.box, "--pin-links")
+        self.web.pages["/notes"] = b"notes, version 2\n"
+        del self.web.pages["/results"]
+        r = self.run_local(self.box, "--check-links")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("CHANGED      Working notes", r.stdout)
+        self.assertIn("UNREACHABLE  Results table", r.stdout)
+        self.assertIn("HTTP 404", r.stdout)
+
+    def test_unreachable_host_is_reported(self):
+        self.run_local(self.box, "--pin-links")
+        self.web.close()
+        self.web = PageServer()  # a fresh port: the pinned address no longer answers
+        r = self.run_local(self.box, "--check-links")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("UNREACHABLE", r.stdout)
+
+    def test_nothing_pinned_is_inconclusive(self):
+        r = self.run_local(self.box, "--check-links")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not pinned   Working notes", r.stdout)
+
+    def test_a_page_that_cannot_be_fetched_is_not_pinned(self):
+        del self.web.pages["/results"]
+        r = self.run_local(self.box, "--pin-links")
+        self.assertEqual(r.returncode, 1)
+        items = self.items()
+        self.assertIn("live_sha256", items[0])
+        self.assertNotIn("live_sha256", items[1])
+
+    def test_pins_travel_with_the_drop_and_are_covered_by_its_check(self):
+        self.run_local(self.box, "--pin-links")
+        out = self.tmp / "drop"
+        self.assertEqual(run(self.box, "--for", "shareable", "--out", out).returncode, 0)
+        pin = self.items()[1]["live_sha256"]
+        self.assertEqual(self.items(out)[0]["live_sha256"], pin)
+        self.assertIn(f"SHA-256 {pin}", (out / "BOX.md").read_text())
+        graph = json.loads((out / "ro-crate-metadata.json").read_text())["@graph"]
+        page = next(e for e in graph if e.get("@id", "").endswith("/results"))
+        self.assertEqual(page["sha256"], pin)
+        # Editing a pin to match a changed page is caught by the drop's own manifests.
+        self.web.pages["/results"] = b"changed\n"
+        data = json.loads((out / "box.json").read_text())
+        data["items"][0]["live_sha256"] = hashlib.sha256(b"changed\n").hexdigest()
+        (out / "box.json").write_text(json.dumps(data))
+        r = self.run_local(out, "--check-links")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("may have been edited", r.stdout)
+
+    def test_check_stays_offline(self):
+        self.run_local(self.box, "--pin-links")
+        out = self.tmp / "drop"
+        self.assertEqual(run(self.box, "--for", "shareable", "--out", out).returncode, 0)
+        self.web.close()
+        self.web = PageServer()
+        self.assertEqual(run(out, "--check").returncode, 0)
+
+    def test_bad_pins_are_refused(self):
+        data = json.loads((self.box / "box.json").read_text())
+        data["items"][1]["live_sha256"] = "not a digest"
+        (self.box / "box.json").write_text(json.dumps(data))
+        r = run(self.box, "--for", "shareable", "--out", self.tmp / "never")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("live_sha256 must be", r.stderr)
+
+    def test_link_options_run_alone(self):
+        for extra in (["--check"], ["--check-links"], ["--for", "shareable"]):
+            r = run(self.box, "--pin-links", *extra)
+            self.assertEqual(r.returncode, 2, extra)
+            self.assertIn("run on their own", r.stderr)
+
+    def test_boxes_without_pins_drop_as_before(self):
+        out = self.tmp / "drop"
+        self.assertEqual(run(EXAMPLE, "--for", "shareable", "--out", out).returncode, 0)
+        self.assertNotIn("live_sha256", (out / "box.json").read_text())
+        self.assertNotIn("pinned", (out / "BOX.md").read_text())
+
+
 class RepositoryTests(unittest.TestCase):
     """Packaging and output conventions."""
 

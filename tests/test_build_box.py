@@ -1221,6 +1221,255 @@ class LogProofTests(unittest.TestCase):
         self.assertIn("--log-signers", r.stderr)
 
 
+ORCID = "0000-0002-1825-0097"  # ORCID's own example iD
+ISNI = "0000000121032683"
+
+
+class IdentifierTests(unittest.TestCase):
+    """Portable ids (content id, drop id), author identifiers and the drop a box replaces."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def edit_box(self, change, box=None):
+        path = (box or self.box) / "box.json"
+        data = json.loads(path.read_text())
+        change(data)
+        path.write_text(json.dumps(data))
+
+    def drop(self, name="drop", box=None):
+        out = self.tmp / name
+        r = run(box or self.box, "--for", "shareable", "--out", out)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return out
+
+    def ids(self, folder):
+        r = run(folder, "--id")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        found = {}
+        for line in r.stdout.splitlines():
+            for name in ("Content id", "Drop id"):
+                if line.startswith(name + ":"):
+                    found[name] = line.split(":", 1)[1].split()[0]
+        return found
+
+    def test_mod_11_2_check_digits(self):
+        bb = load_script()
+        self.assertTrue(bb.iso7064_ok(ORCID.replace("-", "")))
+        self.assertTrue(bb.iso7064_ok("000000021694233X"))
+        self.assertTrue(bb.iso7064_ok(ISNI))
+        self.assertFalse(bb.iso7064_ok("0000000218250098"))
+
+    def test_ids_are_digests_anyone_can_work_out(self):
+        out = self.drop()
+        ids = self.ids(out)
+        tag = hashlib.sha256((out / "tagmanifest-sha256.txt").read_bytes()).hexdigest()
+        self.assertEqual(ids["Drop id"], "sha256:" + tag)
+        lines = [l for l in (out / "manifest-sha256.txt").read_text().splitlines() if l]
+        text = "".join(l + "\n" for l in sorted(lines, key=lambda l: l.split("  ", 1)[1]))
+        self.assertEqual(ids["Content id"],
+                         "sha256:" + hashlib.sha256(text.encode()).hexdigest())
+
+    def test_content_id_ignores_description_and_item_order(self):
+        first = self.ids(self.drop("one"))
+        other = self.tmp / "other"
+        shutil.copytree(EXAMPLE, other)
+
+        def change(d):
+            d["description"] = "Reworded."
+            d["public"]["description"] = "Reworded for everyone."
+            d["items"].reverse()
+        self.edit_box(change, box=other)
+        second = self.ids(self.drop("two", box=other))
+        self.assertEqual(first["Content id"], second["Content id"])
+        self.assertNotEqual(first["Drop id"], second["Drop id"])
+
+    def test_content_id_changes_with_a_file(self):
+        first = self.ids(self.drop("one"))
+        (self.box / "code" / "simulate.py").write_text("print([487, 268])\n")
+        second = self.ids(self.drop("two"))
+        self.assertNotEqual(first["Content id"], second["Content id"])
+
+    def test_id_refuses_a_drop_that_does_not_match(self):
+        out = self.drop()
+        (out / "sheet" / "results.csv").write_text("edited\n")
+        r = run(out, "--id")
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Content id", r.stdout)
+        self.assertEqual(run(self.box / "nothing-here", "--id").returncode, 2)
+
+    def test_author_ids_and_previous_travel_with_the_drop(self):
+        previous = "sha256:" + "ab" * 32
+        self.edit_box(lambda d: d.update(author_ids=[{"scheme": "orcid", "id": ORCID},
+                                                     {"scheme": "isni", "id": ISNI}],
+                                         previous=previous))
+        out = self.drop()
+        copy = json.loads((out / "box.json").read_text())
+        self.assertEqual(copy["author_ids"][0]["id"], ORCID)
+        self.assertEqual(copy["previous"], previous)
+        box_md = (out / "BOX.md").read_text()
+        self.assertIn(f"ORCID {ORCID}; ISNI {ISNI}", box_md)
+        self.assertIn(previous, box_md)
+        graph = json.loads((out / "ro-crate-metadata.json").read_text())["@graph"]
+        author = next(e for e in graph if e["@id"] == "#author")
+        self.assertEqual(author["identifier"], [f"https://orcid.org/{ORCID}",
+                                                f"https://isni.org/isni/{ISNI}"])
+        before = next(e for e in graph if e["@id"] == "#previous-drop")
+        self.assertEqual(before["identifier"], previous)
+        r = run(out, "--id")
+        self.assertIn(f"ORCID {ORCID}", r.stdout)
+        self.assertIn(f"Replaces:   {previous}", r.stdout)
+
+    def test_boxes_without_the_new_fields_drop_as_before(self):
+        out = self.drop()
+        self.assertNotIn("author_ids", json.loads((out / "box.json").read_text()))
+        self.assertNotIn("Author identifiers", (out / "BOX.md").read_text())
+        self.assertNotIn("isBasedOn", (out / "ro-crate-metadata.json").read_text())
+
+    def test_bad_author_ids_are_refused(self):
+        for bad in ([{"scheme": "orcid", "id": "0000-0002-1825-0098"}],   # check digit
+                    [{"scheme": "orcid", "id": f"https://orcid.org/{ORCID}"}],
+                    [{"scheme": "isni", "id": "0000000121032684"}],
+                    [{"scheme": "orcid"}],
+                    {"scheme": "orcid", "id": ORCID}):
+            self.edit_box(lambda d: d.update(author_ids=bad))
+            r = run(self.box, "--for", "shareable", "--out", self.tmp / "never")
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn("author_ids", r.stderr)
+            self.assertFalse((self.tmp / "never").exists())
+
+    def test_other_schemes_are_recorded_unchecked(self):
+        self.edit_box(lambda d: d.update(author_ids=[{"scheme": "github", "id": "octocat"}]))
+        out = self.drop()
+        self.assertIn("github octocat", (out / "BOX.md").read_text())
+        self.assertIn("github:octocat", (out / "ro-crate-metadata.json").read_text())
+
+    def test_bad_previous_is_refused(self):
+        self.edit_box(lambda d: d.update(previous="10.5281/zenodo.123"))
+        r = run(self.box, "--for", "shareable", "--out", self.tmp / "never")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("previous must be the drop id", r.stderr)
+
+    def test_provenance_record_states_the_drops_ids(self):
+        self.edit_box(lambda d: d.update(author_ids=[{"scheme": "orcid", "id": ORCID}]))
+        out = self.drop()
+        record = self.tmp / "provenance.json"
+        r = run(out, "--id", "--provenance", record)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        data = json.loads(record.read_text())
+        ids = self.ids(out)
+        self.assertEqual(data["type"], "research-box-provenance/v1")
+        self.assertEqual(data["content_id"], ids["Content id"])
+        self.assertEqual(data["drop_id"], ids["Drop id"])
+        self.assertEqual(data["author_ids"], [{"scheme": "orcid", "id": ORCID}])
+        self.assertIn("not looked up in any registry", data["claim"])
+        self.assertIn("-n research-box-provenance", r.stdout)
+        self.assertEqual(run(out, "--check").returncode, 0)
+
+    def test_provenance_record_must_be_outside_the_drop(self):
+        out = self.drop()
+        r = run(out, "--id", "--provenance", out / "provenance.json")
+        self.assertEqual(r.returncode, 2)
+        self.assertFalse((out / "provenance.json").exists())
+
+    def test_id_options(self):
+        r = run(EXAMPLE, "--provenance", "p.json")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--provenance goes with --id", r.stderr)
+        r = run(EXAMPLE, "--id", "--check")
+        self.assertEqual(r.returncode, 2)
+        r = run(EXAMPLE, "--verify-provenance", "p.json")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("needs --allowed-signers", r.stderr)
+        r = run(EXAMPLE, "--verify-provenance", "p.json", "--allowed-signers", "s",
+                "--log-proof", "x", "--log-signers", "y")
+        self.assertEqual(r.returncode, 2)
+
+
+@unittest.skipUnless(SSH_KEYGEN, "ssh-keygen (OpenSSH 8.2 or later) is not installed")
+class ProvenanceSignatureTests(unittest.TestCase):
+    """Signed provenance records: an allowed key, and every id the drop's own."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+        data = json.loads((self.box / "box.json").read_text())
+        data["author_ids"] = [{"scheme": "orcid", "id": ORCID}]
+        (self.box / "box.json").write_text(json.dumps(data))
+        self.out = self.tmp / "drop"
+        r = run(self.box, "--for", "shareable", "--out", self.out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.record = self.tmp / "provenance.json"
+        r = run(self.out, "--id", "--provenance", self.record)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.signers = self.tmp / "allowed_signers"
+        self.key = self.tmp / "key_alice"
+        subprocess.run([SSH_KEYGEN, "-q", "-t", "ed25519", "-N", "", "-C", "alice",
+                        "-f", str(self.key)], check=True)
+        public = (self.tmp / "key_alice.pub").read_text().split()[:2]
+        self.signers.write_text(f'alice@example.org namespaces="research-box-provenance" '
+                                f'{" ".join(public)}\n')
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def sign(self, namespace="research-box-provenance"):
+        sig = Path(str(self.record) + ".sig")
+        if sig.exists():
+            sig.unlink()
+        subprocess.run([SSH_KEYGEN, "-q", "-Y", "sign", "-f", str(self.key), "-n", namespace,
+                        str(self.record)], check=True, capture_output=True)
+
+    def verify(self, *extra):
+        return run(self.out, "--verify-provenance", self.record,
+                   "--allowed-signers", self.signers, *extra)
+
+    def test_signed_record_verifies(self):
+        self.sign()
+        r = self.verify()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("Signature: good, by alice@example.org", r.stdout)
+        self.assertIn(f"ORCID {ORCID}", r.stdout)
+        self.assertEqual(self.verify("--signer", "alice@example.org").returncode, 0)
+        self.assertEqual(self.verify("--signer", "bob@example.org").returncode, 1)
+
+    def test_record_edited_after_signing_fails(self):
+        self.sign()
+        data = json.loads(self.record.read_text())
+        data["author"] = "Someone Else"
+        self.record.write_text(json.dumps(data, indent=2) + "\n")
+        self.assertEqual(self.verify().returncode, 1)
+
+    def test_signed_record_for_another_drop_fails(self):
+        data = json.loads(self.record.read_text())
+        data["content_id"] = "sha256:" + "0" * 64
+        self.record.write_text(json.dumps(data, indent=2) + "\n")
+        self.sign()
+        r = self.verify()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("content_id: the record says", r.stdout)
+
+    def test_report_namespace_signature_does_not_count(self):
+        self.sign(namespace="research-box-report")
+        self.assertEqual(self.verify().returncode, 1)
+
+    def test_edited_drop_fails_before_the_signature(self):
+        self.sign()
+        (self.out / "sheet" / "results.csv").write_text("edited\n")
+        r = self.verify()
+        self.assertEqual(r.returncode, 1)
+        self.assertNotIn("Signature:", r.stdout)
+
+    def test_missing_signature_cannot_be_checked(self):
+        self.assertEqual(self.verify().returncode, 2)
+
+
 class RepositoryTests(unittest.TestCase):
     """Packaging and output conventions."""
 

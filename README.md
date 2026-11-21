@@ -105,6 +105,8 @@ The skill tells the agent to run `research-box/scripts/build_box.py`, a Python s
 
 The one exception is `--reproduce`, which runs the command a box declares, and only after you confirm it. That command is the box author's code: it runs with your permissions on a temporary copy of the drop and can do anything you can, including use the network. Opening a box never runs it. For a box from someone you do not know, run it in a container or virtual machine. On Linux, `--no-network` runs it through `unshare` in a network namespace with no network; that cuts off the network, not your files.
 
+`--id` and `--verify-provenance` only read the drop's files, and the latter calls `ssh-keygen` like `--verify-report`.
+
 `--verify-report` runs nothing from the box. It calls the local `ssh-keygen` to check signatures (the report's, and with `--log-proof` the log checkpoint's) and makes no network calls.
 
 ## Versions

@@ -102,6 +102,9 @@ def page(report, source):
     flagged = "".join(
         f"<li>{html.escape(str(s['output']))} = {html.escape(str(s['value']))} appears in "
         f"{html.escape(', '.join(s['files']))}</li>" for s in report.get("stored_values") or [])
+    missed = "".join(
+        f"<li>{html.escape(str(d.get('output')))}: {html.escape(str(d.get('summary')))}</li>"
+        for d in report.get("differences") or [] if isinstance(d, dict))
     title = ("Declared outputs reproduced (automated rerun on GitHub Actions)"
              if report["verdict"] == "reproduced"
              else f"Rerun on GitHub Actions: {report['verdict']}")
@@ -111,6 +114,7 @@ def page(report, source):
 <p><b>Verdict:</b> {html.escape(report['verdict'])}; runs: {', '.join(map(html.escape, r['verdicts']))}; no network.</p>
 <p><b>What this shows:</b> {html.escape(report['claim'])}</p>
 <table><tr><th>Output</th><th>Expected</th><th>Observed (run 1)</th><th></th></tr>{rows}</table>
+{('<h2>What differed (run ' + str(r.get('differences_from_run')) + ')</h2><ul>' + missed + '</ul>') if missed else ''}
 {('<h2>Values already in the box</h2><p>These values appear in the box' + chr(39) + 's own files, so the code may print them rather than compute them:</p><ul>' + flagged + '</ul>') if flagged else ''}
 <h2>Run</h2><p>drop {html.escape(report['drop_id'])}<br>
 {html.escape(report['platform'])}, Python {html.escape(report['python'])}, {html.escape(report['tool'])}<br>
@@ -181,6 +185,10 @@ def main(argv):
     report = dict(runs[0])
     report["verdict"] = verdict
     report["stored_values"] = stored(bb, drop, runs)
+    report.pop("differences", None)
+    differed = next((i for i, run in enumerate(runs, 1) if run.get("differences")), None)
+    if differed is not None and verdict != "reproduced":
+        report["differences"] = runs[differed - 1]["differences"]
     report["runner"] = {
         "runner": "GitHub Actions, research-box rerun workflow (beta)",
         "repository": args.repository,
@@ -197,6 +205,8 @@ def main(argv):
         "submitter": args.submitter or None,
         "assembled": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    if "differences" in report:
+        report["runner"]["differences_from_run"] = differed
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "report.json").write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")

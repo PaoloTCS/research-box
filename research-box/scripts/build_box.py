@@ -446,6 +446,73 @@ def value_ok(v, got):
     return ok
 
 
+def explain(e, row, raw=None):
+    """One structured difference for a row that did not match: which output (and key)
+    missed, what was expected and observed, and by how much against the tolerance. The
+    row is (label, expected, observed, matched) as compare() writes it; raw is the output's
+    bytes where they are at hand (for the first differing line of a text output)."""
+    label, expected, observed, _ = row
+    src = e["source"]
+    d = {"output": label, "source": src, "match": e["match"], "expected": expected,
+         "observed": observed}
+    if label == src and observed == "missing":
+        d.update(reason="output missing", summary="the command did not write this output")
+        return d
+    if e["match"] == "values" and label == f"{src} (values)":
+        d.update(reason="not JSON", summary="the output is not JSON, so no value could be read")
+        return d
+    if e["match"] == "sha256":
+        d.update(reason="hash differs", summary="the bytes differ from the declared SHA-256")
+        if raw is not None:
+            d["observed_bytes"] = len(raw)
+        return d
+    if e["match"] == "text":
+        want = normal_text(e["value"].encode("utf-8")).split("\n")
+        got = normal_text(raw if raw is not None else str(observed).encode("utf-8")).split("\n")
+        line = next((i for i in range(max(len(want), len(got)))
+                     if (want[i:i + 1] or [None]) != (got[i:i + 1] or [None])), None)
+        d.update(reason="text differs", summary="the text differs")
+        if line is not None:
+            exp_line = want[line] if line < len(want) else None
+            got_line = got[line] if line < len(got) else None
+            d["first_difference"] = {"line": line + 1, "expected": exp_line,
+                                     "observed": got_line}
+            d["summary"] = f"the text differs from line {line + 1}"
+        return d
+    v = next((v for v in e["values"] if label == f"{src} {v['key']}"), None)
+    if v is None:  # not a row this expectation writes; describe it as it stands
+        d.update(reason="differs", summary="differs")
+        return d
+    d["key"] = v["key"]
+    if observed == "missing":
+        d.update(reason="key missing", summary=f"no value at {v['key']} in the output")
+        return d
+    if isinstance(observed, bool) or not isinstance(observed, (int, float)):
+        d.update(reason="not a number", summary=f"{v['key']} is {observed!r}, not a number")
+        return d
+    reasons, words = [], []
+    if "equals" in v:
+        allowed = max(v.get("abs", 0), v.get("rel", 0) * abs(v["equals"]))
+        off = observed - v["equals"]
+        d.update(target=v["equals"], difference=off, allowed=allowed,
+                 times_allowed=(abs(off) / allowed) if allowed else None)
+        if abs(off) > allowed:
+            reasons.append("outside tolerance")
+            words.append(f"off by {off:+g}, " + (
+                f"{abs(off) / allowed:.3g} times the allowed {allowed:g}" if allowed
+                else "and no difference is allowed"))
+    if "at_least" in v and observed < v["at_least"]:
+        d["below_by"] = v["at_least"] - observed
+        reasons.append("below at_least")
+        words.append(f"{d['below_by']:g} below the least allowed {v['at_least']:g}")
+    if "at_most" in v and observed > v["at_most"]:
+        d["above_by"] = observed - v["at_most"]
+        reasons.append("above at_most")
+        words.append(f"{d['above_by']:g} above the most allowed {v['at_most']:g}")
+    d.update(reason="; ".join(reasons) or "differs", summary="; ".join(words) or "differs")
+    return d
+
+
 def recheck_expectations(block, rows):
     """Work out again, from the drop's own declared expectations (block["expect"]) and the
     observed values a report records, whether each output matched. Rows are the report's
@@ -539,6 +606,8 @@ def recheck_report(folder, data):
         problems.append(f"the command exited with status {data['exit_code']!r}")
     checked, found = recheck_expectations(block, data.get("expectations"))
     problems += found
+    if data.get("differences"):
+        problems.append("the report lists differences from the expected outputs")
     if not problems and not all(r[3] for r in checked):
         problems.append("an output differs from what the drop expects")
     runner = data.get("runner")
@@ -715,6 +784,7 @@ def reproduce(folder, args):
               "cleared_outputs": cleared,
               "started": started.isoformat(timespec="seconds")}
     rows, verdict, code, exit_code = [], "inconclusive", 2, None
+    differences = []
     try:
         proc = subprocess.run(prefix + command, cwd=work, env=env, stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -735,6 +805,7 @@ def reproduce(folder, args):
                 raw = path.read_bytes() if path.is_file() else None
             got = compare(e, raw)
             rows += got
+            differences += [(r, explain(e, r, raw)) for r in got if not r[3]]
             if e["match"] == "sha256":
                 hashes.append((got[0][0], e["value"]))
             elif e["match"] == "text" and len(e["value"].strip()) >= LITERAL_MIN_TEXT:
@@ -755,9 +826,13 @@ def reproduce(folder, args):
                   ("\n  " + "\n  ".join(tail) if tail else ""))
         ok = exit_code == 0 and all(r[3] for r in rows)
         verdict, code = ("reproduced", 0) if ok else ("did not reproduce", 1)
-    for label, expected, observed, matched in rows:
+    explained = dict((id(r), d) for r, d in differences)
+    for row in rows:
+        label, expected, observed, matched = row
         print(f"  {'match ' if matched else 'DIFFERS'}  {label}: expected {expected}; "
               f"observed {observed}")
+        if id(row) in explained:
+            print(f"           {explained[id(row)]['summary']}")
     print(f"Result: {verdict}. The run's files are in {work}.")
 
     if report is not None:
@@ -767,6 +842,10 @@ def reproduce(folder, args):
                       expectations=[{"output": label, "expected": expected,
                                      "observed": observed, "matched": matched}
                                     for label, expected, observed, matched in rows])
+        if verdict == "did not reproduce" and differences:
+            # Added in 0.6.0, only to reports that did not reproduce: which output and key
+            # missed, expected against observed, and by how much against the tolerance.
+            result["differences"] = [d for _, d in differences]
         report.parent.mkdir(parents=True, exist_ok=True)
         report.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n",
                           encoding="utf-8", newline="\n")

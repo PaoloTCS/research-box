@@ -1638,6 +1638,92 @@ class LinkPinTests(unittest.TestCase):
         self.assertNotIn("pinned", (out / "BOX.md").read_text())
 
 
+class DiffReportTests(unittest.TestCase):
+    """A rerun that does not reproduce says which output and key missed, and by how much."""
+
+    setUp = ReproduceTests.setUp
+    tearDown = ReproduceTests.tearDown
+    edit_box = ReproduceTests.edit_box
+    drop = ReproduceTests.drop
+    add_values_box = ReproduceTests.add_values_box
+
+    def rerun(self, expect):
+        self.add_values_box(expect)
+        out = self.drop()
+        report = self.tmp / "report.json"
+        r = run(out, "--reproduce", "--yes", "--report", report)
+        return r, json.loads(report.read_text())
+
+    def test_values_say_which_key_missed_and_by_how_much(self):
+        r, data = self.rerun([{"source": "out.json", "match": "values", "values": [
+            {"key": "mean_stretch", "equals": 2.80, "abs": 0.01},
+            {"key": "false_promotions", "at_most": 5},
+            {"key": "rows.0.n", "equals": 1024},
+            {"key": "nope", "equals": 1}]}])
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(data["verdict"], "did not reproduce")
+        diffs = {d["output"]: d for d in data["differences"]}
+        self.assertEqual(sorted(diffs), ["out.json false_promotions", "out.json mean_stretch",
+                                         "out.json nope"])
+        stretch = diffs["out.json mean_stretch"]
+        self.assertEqual(stretch["key"], "mean_stretch")
+        self.assertEqual(stretch["reason"], "outside tolerance")
+        self.assertEqual((stretch["target"], stretch["observed"]), (2.80, 2.8412))
+        self.assertAlmostEqual(stretch["difference"], 0.0412)
+        self.assertEqual(stretch["allowed"], 0.01)
+        self.assertAlmostEqual(stretch["times_allowed"], 4.12)
+        promotions = diffs["out.json false_promotions"]
+        self.assertEqual((promotions["reason"], promotions["above_by"]), ("above at_most", 2))
+        self.assertEqual(diffs["out.json nope"]["reason"], "key missing")
+        self.assertIn("off by +0.0412, 4.12 times the allowed 0.01", r.stdout)
+        self.assertIn("2 above the most allowed 5", r.stdout)
+
+    def test_exact_value_with_no_tolerance(self):
+        _, data = self.rerun([{"source": "stdout", "match": "values", "values": [
+            {"key": "false_promotions", "equals": 6}, {"key": "rows", "at_least": 1}]}])
+        by_key = {d["key"]: d for d in data["differences"]}
+        self.assertIsNone(by_key["false_promotions"]["times_allowed"])
+        self.assertIn("no difference is allowed", by_key["false_promotions"]["summary"])
+        self.assertEqual(by_key["rows"]["reason"], "not a number")
+
+    def test_text_names_the_first_differing_line(self):
+        _, data = self.rerun([{"source": "out.txt", "match": "text", "value": "table\nmore"}])
+        d = data["differences"][0]
+        self.assertEqual(d["reason"], "text differs")
+        self.assertEqual(d["first_difference"], {"line": 2, "expected": "more",
+                                                 "observed": None})
+
+    def test_hash_and_missing_outputs(self):
+        _, data = self.rerun([
+            {"source": "out.txt", "match": "sha256", "value": "0" * 64},
+            {"source": "never.json", "match": "values", "values": [{"key": "a", "equals": 1}]},
+            {"source": "out.txt", "match": "values", "values": [{"key": "a", "equals": 1}]}])
+        reasons = [(d["output"], d["reason"]) for d in data["differences"]]
+        self.assertEqual(reasons, [("out.txt (SHA-256)", "hash differs"),
+                                   ("never.json", "output missing"),
+                                   ("out.txt (values)", "not JSON")])
+        self.assertEqual(data["differences"][0]["observed_bytes"], 6)
+
+    def test_a_reproduced_report_has_no_differences_field(self):
+        r, data = self.rerun([{"source": "out.json", "match": "values", "values": [
+            {"key": "mean_stretch", "equals": 2.84, "abs": 0.01}]}])
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertNotIn("differences", data)
+
+    def test_differences_contradict_a_reproduced_verdict(self):
+        self.add_values_box([{"source": "out.json", "match": "values", "values": [
+            {"key": "mean_stretch", "equals": 2.84, "abs": 0.01}]}])
+        out = self.drop()
+        report = self.tmp / "report.json"
+        self.assertEqual(run(out, "--reproduce", "--yes", "--report", report).returncode, 0)
+        data = json.loads(report.read_text())
+        bb = load_script()
+        self.assertEqual(bb.recheck_report(out, data)[1], [])
+        data["differences"] = [{"output": "out.json mean_stretch", "reason": "differs"}]
+        self.assertIn("the report lists differences from the expected outputs",
+                      bb.recheck_report(out, data)[1])
+
+
 class RepositoryTests(unittest.TestCase):
     """Packaging and output conventions."""
 

@@ -124,6 +124,22 @@ class RerunTests(unittest.TestCase):
         self.assertEqual(report["verdict"], "did not reproduce")
         self.assertFalse(report["runner"]["all_reproduced"])
 
+    def test_a_failed_run_shows_what_differed(self):
+        def failed(d):
+            d["verdict"] = "did not reproduce"
+            d["expectations"][0].update(matched=False, observed="[1, 1]")
+            d["differences"] = [{"output": "stdout (text)", "reason": "text differs",
+                                 "summary": "the text differs from line 1"}]
+        out = self.tmp / "out-differed"
+        result = self.assemble(self.tampered(failed), out)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        report = json.loads((out / "report.json").read_text())
+        self.assertEqual(report["differences"][0]["reason"], "text differs")
+        page = (out / "certificate.html").read_text()
+        self.assertEqual(report["runner"]["differences_from_run"], 2)
+        self.assertIn("What differed (run 2)", page)
+        self.assertIn("stdout (text): the text differs from line 1", page)
+
     def test_index_lists_reruns(self):
         out = self.tmp / "out-index"
         self.assemble(self.runs, out)

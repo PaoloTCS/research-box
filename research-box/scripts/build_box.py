@@ -8,6 +8,9 @@ Usage:
   python3 build_box.py <dropped-box> --reproduce [--yes] [--timeout SECONDS] [--report FILE]
   python3 build_box.py <dropped-box> --verify-report REPORT --allowed-signers FILE
                        [--signer IDENTITY] [--signature FILE]
+  python3 build_box.py <dropped-box> --id [--provenance FILE]
+  python3 build_box.py <dropped-box> --verify-provenance FILE --allowed-signers FILE
+                       [--signer IDENTITY] [--signature FILE]
   python3 build_box.py --help
 
 Reads <box-folder>/box.json (format in references/box-format.md). Standard library only.
@@ -51,6 +54,17 @@ Reads <box-folder>/box.json (format in references/box-format.md). Standard libra
           0 verified, 1 a signature, drop, file or verdict does not match, 2 could not check
           (no manifests, unreadable report, no signature file, or no ssh-keygen).
 
+--id      Print the drop's portable identifiers: its content id (the SHA-256 of the manifest's
+          lines sorted by path, so the same files give the same id on any machine) and its
+          drop id (the SHA-256 of tagmanifest-sha256.txt). --provenance FILE writes them, with
+          the author's identifiers (author_ids, e.g. ORCID or ISNI) and the drop it replaces
+          (previous), as a provenance record to sign with an SSH key (Ed25519):
+          ssh-keygen -Y sign -n research-box-provenance FILE.
+--verify-provenance
+          Check a signed provenance record against this drop: the drop matches its
+          manifests, an allowed key signed the record, and every identifier in it is the
+          drop's own. Exit status: 0 verified, 1 does not match, 2 could not check.
+
 A drop is also refused, writing nothing, when a snapshot path leaves the box folder, a
 declared snapshot file is missing, one file is listed under items with different levels, or
 a reproduce command uses a path outside the box or needs a file the drop does not hold.
@@ -77,8 +91,8 @@ from pathlib import Path, PurePath
 
 LEVELS = {"private": 0, "same-assistant": 1, "shareable": 2}
 LABELS = {"private": "Private", "same-assistant": "Same assistant", "shareable": "Shareable"}
-BOX_KEYS = ["box", "title", "description", "created", "dropped", "author", "license",
-            "default_sharing", "topics", "state", "public", "level_labels", "private_terms",
+BOX_KEYS = ["box", "title", "description", "created", "dropped", "author", "author_ids",
+            "license", "previous", "default_sharing", "topics", "state", "public", "level_labels", "private_terms",
             "prepared_for", "reproduce", "items"]
 ITEM_KEYS = ["item", "kind", "live", "revision", "snapshot", "sharing", "notes"]
 REPRO_KEYS = ["name", "command", "inputs", "requires", "timeout_seconds", "sharing", "expect"]
@@ -1029,6 +1043,231 @@ def finish_verify(folder, data, raw, identity, logged, args, signature):
     return 0
 
 
+# ---------------------------------------------------------------------------------------
+# Portable identifiers and signed provenance. A drop has two ids, both SHA-256 digests that
+# anyone can work out again from the files alone, on any machine:
+#   content id  the SHA-256 of the manifest's lines ("<hash>  <path>"), sorted by path: the
+#               snapshot files and nothing else, so it survives a change of wording in
+#               BOX.md or a different item order;
+#   drop id     the SHA-256 of tagmanifest-sha256.txt: this exact drop with its description
+#               (the id a reproduction report names).
+# A box may also name its author's identifiers (ORCID, ISNI or others, never minted here)
+# and the drop it replaces. A provenance record states all of these, and whoever vouches
+# for them signs it with an SSH key (Ed25519), as with reports.
+
+PROVENANCE_NAMESPACE = "research-box-provenance"
+PROVENANCE_TYPE = "research-box-provenance/v1"
+PROVENANCE_CLAIM = ("The signer vouches that these files, with this description, are this "
+                    "box, by this author, replacing the drop named as previous. The ids are "
+                    "digests of the files; the author identifiers were not looked up in any "
+                    "registry.")
+ID_PATTERN = r"sha256:[0-9a-f]{64}"
+CHECKED_SCHEMES = {"orcid": "ORCID", "isni": "ISNI"}
+
+
+def iso7064_ok(digits):
+    """ISO 7064 MOD 11-2 check character, as ORCID and ISNI use it."""
+    total = 0
+    for c in digits[:-1]:
+        total = (total + int(c)) * 2
+    rest = (12 - total % 11) % 11
+    return digits[-1] == ("X" if rest == 10 else str(rest))
+
+
+def author_id_problem(entry):
+    """Why an author_ids entry is not valid, or None."""
+    if not isinstance(entry, dict) or not isinstance(entry.get("scheme"), str) \
+            or not isinstance(entry.get("id"), str) or not entry["id"].strip() \
+            or not entry["scheme"].strip():
+        return "each entry needs a scheme and an id, e.g. {\"scheme\": \"orcid\", " \
+               "\"id\": \"0000-0002-1825-0097\"}"
+    unknown = [k for k in entry if k not in ("scheme", "id")]
+    if unknown:
+        return f"unknown field(s) {', '.join(unknown)}"
+    scheme, value = entry["scheme"].lower(), entry["id"]
+    if scheme == "orcid":
+        if not re.fullmatch(r"\d{4}-\d{4}-\d{4}-\d{3}[\dX]", value) \
+                or not iso7064_ok(value.replace("-", "")):
+            return f"{value!r} is not an ORCID iD (16 digits in groups of four, last one a " \
+                   f"check digit or X, without https://orcid.org/)"
+    if scheme == "isni":
+        digits = value.replace(" ", "")
+        if not re.fullmatch(r"\d{15}[\dX]", digits) or not iso7064_ok(digits):
+            return f"{value!r} is not an ISNI (16 digits, last one a check digit or X)"
+    return None
+
+
+def read_identity(box, refuse):
+    """Check author_ids and previous. Returns (author_ids, previous)."""
+    ids = box.get("author_ids", [])
+    if not isinstance(ids, list):
+        refuse("author_ids must be a list.")
+    for i, entry in enumerate(ids, 1):
+        why = author_id_problem(entry)
+        if why:
+            refuse(f"author_ids[{i}]: {why}.")
+    previous = box.get("previous")
+    if previous is not None and (not isinstance(previous, str)
+                                 or not re.fullmatch(ID_PATTERN, previous)):
+        refuse("previous must be the drop id of the drop this one replaces: "
+               "sha256: and 64 lowercase hex digits.")
+    return ids, previous
+
+
+def author_id_text(entry):
+    scheme = entry["scheme"].lower()
+    return f"{CHECKED_SCHEMES.get(scheme, entry['scheme'])} {entry['id']}"
+
+
+def author_id_uri(entry):
+    """The identifier as a URI where the scheme has a usual one."""
+    scheme = entry["scheme"].lower()
+    if scheme == "orcid":
+        return f"https://orcid.org/{entry['id']}"
+    if scheme == "isni":
+        return f"https://isni.org/isni/{entry['id'].replace(' ', '')}"
+    return f"{entry['scheme']}:{entry['id']}"
+
+
+def content_id(folder):
+    """The SHA-256 of the manifest's lines sorted by path, as "sha256:<hex>"."""
+    rows = []
+    for line in (Path(folder) / "manifest-sha256.txt").read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            h, rel = line.split("  ", 1)
+            rows.append((rel, h))
+    text = "".join(f"{h}  {rel}\n" for rel, h in sorted(rows))
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def drop_identity(folder):
+    """What a drop says about itself: ids, box name, dates, author and author ids."""
+    folder = Path(folder)
+    box = json.loads((folder / "box.json").read_text(encoding="utf-8"))
+    files = sum(1 for line in (folder / "manifest-sha256.txt").read_text(
+        encoding="utf-8").splitlines() if line.strip())
+    return {"box": box.get("box", ""), "dropped": box.get("dropped", ""),
+            "content_id": content_id(folder),
+            "drop_id": "sha256:" + sha256(folder / "tagmanifest-sha256.txt"),
+            "files": files, "author": box.get("author"),
+            "author_ids": box.get("author_ids", []), "previous": box.get("previous")}
+
+
+def show_id(folder, args):
+    """Print a drop's identifiers and optionally write a provenance record. Exit status as
+    --check: 0 printed, 1 the drop does not match its manifests, 2 no manifests."""
+    folder = Path(folder)
+    if args.provenance is not None:
+        r = args.provenance.resolve()
+        if r == folder.resolve() or folder.resolve() in r.parents:
+            print("--provenance must be outside the drop, so the drop still matches its "
+                  "manifests. Nothing was written.")
+            return 2
+    status = check(folder)
+    if status != 0:
+        print("The drop does not match its manifests, so its ids would not describe these "
+              "files. Nothing was written.")
+        return status
+    def stop(message):
+        raise SystemExit(message)
+
+    try:
+        ident = drop_identity(folder)
+        read_identity(json.loads((folder / "box.json").read_text(encoding="utf-8")), stop)
+    except (OSError, ValueError, SystemExit) as err:
+        print(f"Could not read the drop's box.json ({err}). Nothing was written.")
+        return 2
+    print(f"Box:        {ident['box']} (dropped {ident['dropped'] or 'on an unrecorded date'})")
+    print(f"Content id: {ident['content_id']}  (the {ident['files']} snapshot file(s))")
+    print(f"Drop id:    {ident['drop_id']}  (this drop with its description)")
+    if ident["author"]:
+        print(f"Author:     {ident['author']}")
+    for entry in ident["author_ids"]:
+        print(f"            {author_id_text(entry)}")
+    if ident["previous"]:
+        print(f"Replaces:   {ident['previous']}")
+    if args.provenance is not None:
+        record = {"type": PROVENANCE_TYPE, **ident, "tool": f"research-box {VERSION}",
+                  "written": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                  "claim": PROVENANCE_CLAIM}
+        args.provenance.parent.mkdir(parents=True, exist_ok=True)
+        args.provenance.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n",
+                                   encoding="utf-8", newline="\n")
+        print(f"Provenance record written to {args.provenance}. Sign it with your SSH key:")
+        print(f"  ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n {PROVENANCE_NAMESPACE} "
+              f"{shlex.quote(str(args.provenance))}")
+    return 0
+
+
+def verify_provenance(folder, args):
+    """Check a signed provenance record against a drop. Exit status: 0 verified, 1 the drop,
+    signature or an identifier does not match, 2 the check could not be made."""
+    folder = Path(folder)
+    record_path = args.verify_provenance
+    signature = args.signature or Path(str(record_path) + ".sig")
+    try:
+        raw = record_path.read_bytes()
+        record = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as err:
+        print(f"Could not read the record {record_path} ({err}). Nothing was verified.")
+        return 2
+    if not isinstance(record, dict) or record.get("type") != PROVENANCE_TYPE:
+        print(f"{record_path} is not a research-box provenance record (type "
+              f"{PROVENANCE_TYPE}). Nothing was verified.")
+        return 2
+    for path, what in ((signature, "signature"), (args.allowed_signers, "allowed-signers file")):
+        if not path.is_file():
+            print(f"No {what} at {path}. Nothing was verified.")
+            return 2
+    print("Checking the drop against its manifests first.")
+    status = check(folder)
+    if status != 0:
+        print("The drop does not match its manifests, so the record cannot be about these "
+              "files. Not verified.")
+        return status
+    sig_text = signature.read_text(encoding="utf-8")
+    if args.signer:
+        with tempfile.TemporaryDirectory() as d:
+            sig = Path(d) / "sig"
+            sig.write_text(sig_text, encoding="utf-8", newline="\n")
+            result = ssh_keygen(["-Y", "verify", "-f", str(args.allowed_signers), "-I",
+                                 args.signer, "-n", PROVENANCE_NAMESPACE, "-s", str(sig)], raw)
+        if result is None:
+            status, who = 2, "ssh-keygen (OpenSSH 8.2 or later) was not found"
+        else:
+            status, who = (0, args.signer) if result[0] == 0 else \
+                (1, f"no valid signature by {args.signer}")
+    else:
+        status, who = check_signature(raw, sig_text, args.allowed_signers, PROVENANCE_NAMESPACE)
+    if status != 0:
+        print(f"Signature: {who} (namespace {PROVENANCE_NAMESPACE}). "
+              + ("Nothing was verified." if status == 2 else "Not verified."))
+        return status
+    print(f"Signature: good, by {who}.")
+    try:
+        ident = drop_identity(folder)
+    except (OSError, ValueError) as err:
+        print(f"Could not read the drop's box.json ({err}). Nothing was verified.")
+        return 2
+    wrong = [k for k in ("box", "dropped", "content_id", "drop_id", "files", "author",
+                         "author_ids", "previous") if record.get(k) != ident[k]]
+    for k in wrong:
+        print(f"  {k}: the record says {record.get(k)!r}; this drop says {ident[k]!r}")
+    if wrong:
+        print("Result: not verified. The signed record describes another drop or another "
+              "author.")
+        return 1
+    who_wrote = ident["author"] or "an unnamed author"
+    if ident["author_ids"]:
+        who_wrote += " (" + ", ".join(author_id_text(e) for e in ident["author_ids"]) + ")"
+    print(f"Result: verified. {who} signed that content {ident['content_id']}, drop "
+          f"{ident['drop_id']}, is the box {ident['box']} by {who_wrote}"
+          + (f", replacing {ident['previous']}" if ident["previous"] else "") + ". A "
+          "signature shows who vouches for these claims; the author identifiers were not "
+          "looked up in any registry.")
+    return 0
+
+
 def parse(argv):
     p = argparse.ArgumentParser(
         prog="build_box.py",
@@ -1088,10 +1327,36 @@ def parse(argv):
     p.add_argument("--bundle", type=Path, metavar="FILE",
                    help="with --attested-by: the attestation bundle on disk (default: "
                         "fetch it from GitHub)")
+    p.add_argument("--id", action="store_true",
+                   help="print a dropped box's portable identifiers: its content id and "
+                        "drop id (SHA-256 digests), author identifiers and the drop it "
+                        "replaces")
+    p.add_argument("--provenance", type=Path, metavar="FILE",
+                   help="with --id: write them as a provenance record to sign with "
+                        "ssh-keygen -Y sign -n research-box-provenance (outside the drop)")
+    p.add_argument("--verify-provenance", type=Path, metavar="RECORD",
+                   help="check a signed provenance record against this drop; exit 0 "
+                        "verified, 1 does not match, 2 could not check")
     args = p.parse_args(argv[1:])
+    if args.provenance is not None and not args.id:
+        p.error("--provenance goes with --id")
+    if args.id and (args.check or args.reproduce or args.verify_report is not None
+                    or args.verify_provenance is not None or args.out or args.strict
+                    or args.audience != "private"):
+        p.error("--id reads a dropped box on its own; use it without other commands, "
+                "--for, --out or --strict")
+    if args.verify_provenance is not None:
+        if args.allowed_signers is None:
+            p.error("--verify-provenance needs --allowed-signers FILE")
+        if (args.check or args.reproduce or args.verify_report is not None or args.out
+                or args.strict or args.log_proof is not None or args.log_signers is not None
+                or args.attested_by is not None or args.audience != "private"):
+            p.error("--verify-provenance checks a dropped box on its own; use it without "
+                    "other commands, --for, --out, --strict, --log-proof or --attested-by")
     verify_only = (args.allowed_signers, args.signer, args.signature, args.log_proof,
                    args.log_signers)
-    if args.verify_report is None and any(v is not None for v in verify_only):
+    if args.verify_report is None and args.verify_provenance is None and \
+            any(v is not None for v in verify_only):
         p.error("--allowed-signers, --signer, --signature, --log-proof and --log-signers "
                 "go with --verify-report")
     if (args.log_proof is None) != (args.log_signers is None):
@@ -1142,6 +1407,10 @@ def main(argv):
         sys.exit(reproduce(folder, args))
     if args.verify_report is not None:
         sys.exit(verify_report(folder, args))
+    if args.id:
+        sys.exit(show_id(folder, args))
+    if args.verify_provenance is not None:
+        sys.exit(verify_provenance(folder, args))
     audience, out = args.audience, args.out
     if not (folder / "box.json").is_file():
         sys.exit(f"No box.json in {folder}.")
@@ -1162,6 +1431,7 @@ def main(argv):
 
     items = [dict(it, sharing=level_of(it.get("sharing"), box, f"item {it['item']!r}"))
              for it in box["items"]]
+    author_ids, previous = read_identity(box, refuse)
 
     # One file, one level: a file listed under items with different sharing levels is
     # ambiguous, so the drop is refused until the box says which level it has.
@@ -1268,6 +1538,10 @@ def main(argv):
         lines.append(f"- Default sharing: {LABELS[box_level]}")
     if box.get("author"):
         lines.append(f"- Author: {box['author']}")
+    if author_ids:
+        lines.append("- Author identifiers: " + "; ".join(author_id_text(e) for e in author_ids))
+    if previous:
+        lines.append(f"- Replaces the drop: {previous}")
     if topics:
         lines.append(f"- Topics: {'; '.join(topics)}")
     lines += ["", "## Contents", "",
@@ -1329,9 +1603,17 @@ def main(argv):
         root["keywords"] = topics
     if box.get("license"):
         root["license"] = box["license"]
-    if box.get("author"):
+    if box.get("author") or author_ids:
         root["author"] = {"@id": "#author"}
-        entities.append({"@id": "#author", "@type": "Person", "name": box["author"]})
+        person = {"@id": "#author", "@type": "Person",
+                  "name": box.get("author") or "Unnamed author"}
+        if author_ids:
+            person["identifier"] = [author_id_uri(e) for e in author_ids]
+        entities.append(person)
+    if previous:
+        root["isBasedOn"] = {"@id": "#previous-drop"}
+        entities.append({"@id": "#previous-drop", "@type": "Dataset", "identifier": previous,
+                         "name": f"The earlier drop of {box['box']} that this one replaces"})
     if repro_kept:
         # The author's recorded run, in the shape of the Workflow Run RO-Crate profiles
         # (CreateAction with instrument, object and result). The expected outputs are
@@ -1387,7 +1669,7 @@ def main(argv):
         # state lines as written, so a later export from the copy keeps every label.
         keep_settings = audience != "shareable"
         copy = {}
-        for k in ("box", "created", "dropped", "author", "license"):
+        for k in ("box", "created", "dropped", "author", "author_ids", "license", "previous"):
             if k in box:
                 copy[k] = box[k]
         copy["default_sharing"] = box_level if use_box else audience

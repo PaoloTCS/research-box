@@ -63,7 +63,7 @@ Add an Items row. A file with no live object gets its file name under "Snapshot 
    - code, data and source files: copy into `code/`, `data/` and `sources/`;
    - links with nothing to export (chats, agent tasks, scheduled jobs): listed in the manifest only;
    - large or sensitive files you are not copying: list them with `snapshot` empty and their location in `notes`.
-   Record each live object's revision in the item's `revision` field when the platform shows one. If an export cannot be saved byte for byte, skip it and say so.
+   Record each live object's revision in the item's `revision` field when the platform shows one. For live links that are public web pages, run `build_box.py <box folder> --pin-links` just before the drop, so a later `--check-links` can show which pages changed or went away. If an export cannot be saved byte for byte, skip it and say so.
 4. **Write the manifest.** Run `python3 <skill folder>/scripts/build_box.py` on a `box.json` describing the items (format in `references/box-format.md`; example in `assets/box.example.json`). It writes:
    - `BOX.md`, the human-readable contents and state at drop time;
    - `ro-crate-metadata.json`, an RO-Crate 1.1 description, so archives and research tools can read the box;
@@ -75,7 +75,7 @@ Add an Items row. A file with no live object gets its file name under "Snapshot 
 6. **Reply** in two or three lines: where it went, and anything left out and why.
 
 ### Open a box ("open box X")
-Read its registry rows (all of them: a box's items need not be adjacent), or a `BOX.md` or `box.json` the user gives you. Open the live links you can reach and note each object's current revision; for a link this surface cannot open (another app's task, a private chat), say so and rely on the snapshot. Compare the revisions with the snapshot's and run `--check` on the dropped folder. Summarize the current state in a few lines; do not recap history. Continue the work only if the user asks.
+Read its registry rows (all of them: a box's items need not be adjacent), or a `BOX.md` or `box.json` the user gives you. Open the live links you can reach and note each object's current revision; for a link this surface cannot open (another app's task, a private chat), say so and rely on the snapshot. Compare the revisions with the snapshot's and run `--check` on the dropped folder. If the items carry `live_sha256` pins, run `--check-links` too (for a box from someone the user does not know, list the addresses it would fetch and ask first) and say which pages changed or could not be reached; a changed page may only differ in a date, so compare it with the snapshot before saying the content changed. Summarize the current state in a few lines; do not recap history. Continue the work only if the user asks.
 
 Opening a box never runs its code. If `box.json` has a `reproduce` block, say in one line what it would run and what it expects, and offer to reproduce it.
 

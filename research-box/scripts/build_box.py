@@ -75,6 +75,7 @@ which it names, so their outputs can be inspected.
 import argparse
 import base64
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -84,6 +85,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime, timezone
@@ -94,7 +97,8 @@ LABELS = {"private": "Private", "same-assistant": "Same assistant", "shareable":
 BOX_KEYS = ["box", "title", "description", "created", "dropped", "author", "author_ids",
             "license", "previous", "default_sharing", "topics", "state", "public", "level_labels", "private_terms",
             "prepared_for", "reproduce", "items"]
-ITEM_KEYS = ["item", "kind", "live", "revision", "snapshot", "sharing", "notes"]
+ITEM_KEYS = ["item", "kind", "live", "live_sha256", "live_pinned", "revision", "snapshot",
+             "sharing", "notes"]
 REPRO_KEYS = ["name", "command", "inputs", "requires", "timeout_seconds", "sharing", "expect"]
 GENERATED = {"BOX.md", "box.json", "ro-crate-metadata.json", "manifest-sha256.txt",
              "tagmanifest-sha256.txt"}
@@ -1268,6 +1272,130 @@ def verify_provenance(folder, args):
     return 0
 
 
+# ---------------------------------------------------------------------------------------
+# Link rot. An item's live page can change or vanish after the drop. --pin-links fetches each
+# web page an item links to and records its SHA-256 in box.json (live_sha256, live_pinned);
+# --check-links fetches them again and reports which pinned pages changed or cannot be
+# reached. These are the script's only network calls, and only these two options make them.
+
+LINK_TIMEOUT = 30
+LINK_MAX_BYTES = 50 << 20
+
+
+def web_link(url):
+    return isinstance(url, str) and re.match(r"https?://[^\s/]+", url, re.I) is not None
+
+
+def fetch_digest(url, timeout=LINK_TIMEOUT):
+    """Fetch a web page and return (sha256 hex, None), or (None, reason it failed)."""
+    request = urllib.request.Request(
+        url, headers={"User-Agent": f"research-box/{VERSION} (link check)"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            h, size = hashlib.sha256(), 0
+            for chunk in iter(lambda: response.read(1 << 16), b""):
+                size += len(chunk)
+                if size > LINK_MAX_BYTES:
+                    return None, f"larger than {LINK_MAX_BYTES >> 20} MB"
+                h.update(chunk)
+            return h.hexdigest(), None
+    except urllib.error.HTTPError as err:
+        return None, f"HTTP {err.code}"
+    except urllib.error.URLError as err:
+        return None, str(err.reason)
+    except (OSError, ValueError, http.client.HTTPException) as err:
+        return None, str(err) or type(err).__name__
+
+
+def pin_links(folder):
+    """Fetch every item's live web page and record its SHA-256 in box.json. Exit status:
+    0 every page pinned, 1 some page could not be fetched (the others are pinned),
+    2 nothing to pin."""
+    folder = Path(folder)
+    path = folder / "box.json"
+    if not path.is_file():
+        print(f"No box.json in {folder}: nothing to pin.")
+        return 2
+    box = json.loads(path.read_text(encoding="utf-8"))
+    today = datetime.now(timezone.utc).date().isoformat()
+    pinned, failed = 0, 0
+    for it in box.get("items", []):
+        url = it.get("live")
+        if not web_link(url):
+            continue
+        digest, why = fetch_digest(url)
+        if digest is None:
+            failed += 1
+            print(f"  not pinned  {it['item']}: {url} ({why})")
+            continue
+        before = it.get("live_sha256")
+        it["live_sha256"], it["live_pinned"] = digest, today
+        pinned += 1
+        change = "" if before is None else (" (unchanged)" if before == digest
+                                              else " (changed since the last pin)")
+        print(f"  pinned      {it['item']}: {url} sha256 {digest}{change}")
+    if not pinned and not failed:
+        print("No item links to a web page (http or https). Nothing was pinned.")
+        return 2
+    if pinned:
+        path.write_text(json.dumps(box, indent=2, ensure_ascii=False) + "\n",
+                        encoding="utf-8", newline="\n")
+        print(f"{pinned} page(s) pinned in {path}. Drop the box again so its manifests "
+              "cover the pins.")
+    if failed:
+        print(f"{failed} page(s) could not be fetched and were not pinned.")
+        return 1
+    return 0
+
+
+def check_links(folder):
+    """Fetch every pinned live page again and compare. Exit status: 0 every pinned page is
+    unchanged (and the drop, if it has manifests, matches them), 1 a pinned page changed or
+    cannot be reached (or the drop does not match), 2 no page is pinned."""
+    folder = Path(folder)
+    path = folder / "box.json"
+    if not path.is_file():
+        print(f"No box.json in {folder}: nothing to check.")
+        return 2
+    drop_status = 0
+    if (folder / "manifest-sha256.txt").is_file():
+        print("Checking the drop against its manifests first.")
+        drop_status = check(folder)
+        if drop_status == 1:
+            print("The drop does not match its manifests, so its pins may have been edited; "
+                  "the pages are checked against the pins box.json holds now.")
+    box = json.loads(path.read_text(encoding="utf-8"))
+    changed, gone, same, unpinned = [], [], [], []
+    for it in box.get("items", []):
+        url = it.get("live")
+        if not web_link(url):
+            continue
+        pin = it.get("live_sha256")
+        if pin is None:
+            unpinned.append(it["item"])
+            print(f"  not pinned   {it['item']}: {url}")
+            continue
+        when = it.get("live_pinned", "an unrecorded date")
+        digest, why = fetch_digest(url)
+        if digest is None:
+            gone.append(it["item"])
+            print(f"  UNREACHABLE  {it['item']}: {url} ({why}); pinned {when}")
+        elif digest != pin:
+            changed.append(it["item"])
+            print(f"  CHANGED      {it['item']}: {url} now sha256 {digest}; pinned {when} "
+                  f"as {pin}")
+        else:
+            same.append(it["item"])
+            print(f"  unchanged    {it['item']}: {url} (pinned {when})")
+    if not (changed or gone or same):
+        print("No live page is pinned. Pin them with --pin-links before the drop.")
+        return 2
+    print(f"Result: {len(same)} unchanged, {len(changed)} changed, {len(gone)} unreachable"
+          + (f", {len(unpinned)} not pinned" if unpinned else "") + ". A page that changed may "
+          "only show a new date or layout; compare it with the snapshot before relying on it.")
+    return 1 if changed or gone or drop_status == 1 else 0
+
+
 def parse(argv):
     p = argparse.ArgumentParser(
         prog="build_box.py",
@@ -1327,6 +1455,13 @@ def parse(argv):
     p.add_argument("--bundle", type=Path, metavar="FILE",
                    help="with --attested-by: the attestation bundle on disk (default: "
                         "fetch it from GitHub)")
+    p.add_argument("--pin-links", action="store_true",
+                   help="fetch every item's live web page and record its SHA-256 in "
+                        "box.json (live_sha256); uses the network")
+    p.add_argument("--check-links", action="store_true",
+                   help="fetch every pinned live page again and report which changed or "
+                        "cannot be reached; uses the network; exit 0 all unchanged, 1 changed "
+                        "or unreachable, 2 none pinned")
     p.add_argument("--id", action="store_true",
                    help="print a dropped box's portable identifiers: its content id and "
                         "drop id (SHA-256 digests), author identifiers and the drop it "
@@ -1338,6 +1473,12 @@ def parse(argv):
                    help="check a signed provenance record against this drop; exit 0 "
                         "verified, 1 does not match, 2 could not check")
     args = p.parse_args(argv[1:])
+    if args.pin_links or args.check_links:
+        if (args.pin_links and args.check_links) or args.check or args.reproduce or args.id \
+                or args.verify_report is not None or args.verify_provenance is not None \
+                or args.out or args.strict or args.audience != "private":
+            p.error("--pin-links and --check-links each run on their own; use them without "
+                    "other commands, --for, --out or --strict")
     if args.provenance is not None and not args.id:
         p.error("--provenance goes with --id")
     if args.id and (args.check or args.reproduce or args.verify_report is not None
@@ -1407,6 +1548,10 @@ def main(argv):
         sys.exit(reproduce(folder, args))
     if args.verify_report is not None:
         sys.exit(verify_report(folder, args))
+    if args.pin_links:
+        sys.exit(pin_links(folder))
+    if args.check_links:
+        sys.exit(check_links(folder))
     if args.id:
         sys.exit(show_id(folder, args))
     if args.verify_provenance is not None:
@@ -1432,6 +1577,11 @@ def main(argv):
     items = [dict(it, sharing=level_of(it.get("sharing"), box, f"item {it['item']!r}"))
              for it in box["items"]]
     author_ids, previous = read_identity(box, refuse)
+    for it in items:
+        if "live_sha256" in it and not (web_link(it.get("live")) and isinstance(
+                it["live_sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", it["live_sha256"])):
+            refuse(f"item {it['item']!r}: live_sha256 must be 64 lowercase hex digits, on an "
+                   "item whose live link is a web page.")
 
     # One file, one level: a file listed under items with different sharing levels is
     # ambiguous, so the drop is refused until the box says which level it has.
@@ -1553,6 +1703,9 @@ def main(argv):
         note = it.get("notes", "")
         if it.get("revision"):
             note = f"Revision {it['revision']}. {note}".strip()
+        if it.get("live_sha256"):
+            when = f" {it['live_pinned']}" if it.get("live_pinned") else ""
+            note = f"Live page pinned{when}: SHA-256 {it['live_sha256']}. {note}".strip()
         lines.append(f"| {it['item']} | {it.get('kind', '')} | {live} | {snap} | "
                      f"{LABELS[it['sharing']]} | {note} |")
     if state:
@@ -1595,6 +1748,10 @@ def main(argv):
                    "description": f"Live object; sharing: {it['sharing']}"}
             if it.get("revision"):
                 ent["version"] = str(it["revision"])
+            if it.get("live_sha256"):
+                ent["sha256"] = it["live_sha256"]
+                if it.get("live_pinned"):
+                    ent["sdDatePublished"] = it["live_pinned"]
             entities.append(ent)
     root = {"@id": "./", "@type": "Dataset", "name": title, "identifier": box["box"],
             "description": description or f"Research box {box['box']}",

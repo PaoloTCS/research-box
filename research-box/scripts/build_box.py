@@ -4,6 +4,7 @@
 Usage:
   python3 build_box.py <box-folder> [--for shareable|same-assistant|private] [--out <folder>]
                        [--strict [--allow-unscanned]]
+  python3 build_box.py <box-folder> --for shareable --preview
   python3 build_box.py <box-folder> --check
   python3 build_box.py <dropped-box> --reproduce [--yes] [--timeout SECONDS] [--report FILE]
   python3 build_box.py <dropped-box> --verify-report REPORT --allowed-signers FILE
@@ -27,6 +28,12 @@ Reads <box-folder>/box.json (format in references/box-format.md). Standard libra
           Required whenever the drop holds anything back (items, state lines or box
           details); without it the script refuses, so nothing held back can sit beside
           what is shared.
+--preview Work the drop out as it would be written and write nothing: list what the
+          readers get (items, files and sizes, details, the reproduce command, receipts),
+          what is left out and what BOX.md tells them about it, the watch-word scan, and
+          what each check they can run does and does not show. A drop that holds something
+          back is shown as the clean copy --out would write. Exit status: 0 the drop can be
+          written, 1 it would be refused (with --strict, watch words or unscanned files).
 --check   Compare the folder's files with manifest-sha256.txt and tagmanifest-sha256.txt and
           report files that changed, went missing or are not in the manifests. Writes nothing.
           Exit status: 0 = everything matches, 1 = a file changed, went missing or is not
@@ -2028,6 +2035,139 @@ def audit(folder, args):
         print(f"Summary written to {args.summary}.")
     return overall
 
+# ---------------------------------------------------------------------------------------
+# Recipient preview. --preview works a drop out exactly as it would be written, writes
+# nothing, and says in plain words what the recipient gets, what is left out, what the
+# drop's BOX.md tells them about it, and what each check they can run does and does not
+# show.
+
+def size_text(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def preview(box, audience, out, held, kept, left_out, sums, details, use_box, state,
+            state_held, repro, repro_held, extra_fields, receipts_kept, receipts_held,
+            receipts_stale, texts, hits, unscanned, scanned, strict, allow_unscanned):
+    """Print what a drop would give its readers. Exit status: 0 the drop can be written
+    (with --out when it holds something back), 1 --strict would refuse it."""
+    who = f"{LABELS[audience]} readers"
+    print(f"Preview of a drop of {box['box']} for {who}. Nothing was written.")
+    print("")
+    print("The recipient gets:")
+    if kept:
+        for it in kept:
+            files = it.get("snapshot", [])
+            live = " and its live link" if it.get("live") else ""
+            print(f"  - {it['item']} ({it.get('kind') or 'item'}): "
+                  + (f"{len(files)} file(s){live}" if files else
+                     f"no file, only its live link" if it.get("live") else "a name only"))
+    else:
+        print("  - no items")
+    total = sum(size for _, _, size in sums)
+    print(f"  - {len(sums)} file(s), {size_text(total)} in all"
+          + (": " + ", ".join(f"{rel} ({size_text(size)})" for _, rel, size in sums[:12])
+             + (f" and {len(sums) - 12} more" if len(sums) > 12 else "") if sums else ""))
+    if use_box:
+        print(f"  - the box's own title ({details.get('title', box['box'])}), description, "
+              "topics and state")
+    elif box.get("public"):
+        print(f"  - the public wording in place of the box's own: title "
+              f"{details.get('title', box['box'])}"
+              + (", a description" if details.get("description") else "")
+              + (f", {len(details.get('topics', []))} topic(s)" if details.get("topics") else "")
+              + (f", {len(state)} state line(s)" if state else ""))
+    else:
+        print("  - the box's name only, not its title, description, topics or state")
+    if use_box and state:
+        print(f"  - {len(state)} state line(s)")
+    if box.get("author"):
+        print(f"  - the author's name ({box['author']})"
+              + (" and identifiers" if box.get("author_ids") else ""))
+    if repro:
+        print(f"  - the reproduce command: {command_text(repro['command'])}")
+    if receipts_kept:
+        print(f"  - {len(receipts_kept)} registry receipt(s)")
+    print("  - the generated files: BOX.md, box.json, ro-crate-metadata.json and the two "
+          "checksum manifests")
+    print("")
+    left = []
+    if left_out:
+        left.append(f"{len(left_out)} item(s): " + ", ".join(
+            f"{it['item']} ({LABELS[it['sharing']]})" for it in left_out))
+    if state_held:
+        left.append(f"{state_held} state line(s) narrower than {who}")
+    if not use_box:
+        left.append("the box's own title, description, topics and state"
+                    + (" (the public wording is used instead)" if box.get("public") else ""))
+    if repro_held:
+        left.append("the reproduce command")
+    if receipts_held:
+        left.append(f"{receipts_held} registry receipt(s) about items left out")
+    if receipts_stale and (out or held):
+        left.append(f"{receipts_stale} registry receipt(s) for claims the box no longer makes")
+    settings = [k for k in ("private_terms", "public", "level_labels") if k in box]
+    if settings and audience == "shareable":
+        left.append("the box's settings (" + ", ".join(settings) + "), never copied into a "
+                    "shareable drop")
+    if extra_fields and (out or held or audience != "private"):
+        left.append("field(s) outside the format: " + ", ".join(extra_fields))
+    print("Left out:" if left else "Left out: nothing.")
+    for line in left:
+        print(f"  - {line}")
+    said = [ln for ln in texts["BOX.md"].splitlines() if "were left out" in ln]
+    if left:
+        print(("BOX.md says: \"" + " ".join(said) + "\" " if said else
+               "BOX.md says nothing about what was left out. ")
+              + "Nothing else in the drop names what is missing.")
+    print("")
+    if not scanned:
+        print("Watch words: " + ("scanned only in shareable drops." if box.get("private_terms")
+                                 else "the box lists none (private_terms)."))
+    elif hits or unscanned:
+        for text in hits.values():
+            print(f"Watch words: {text}")
+        if unscanned:
+            print("Not scanned for watch words (check by eye): " + ", ".join(unscanned))
+    else:
+        print("Watch words: none found in any generated file or text snapshot.")
+    print("")
+    print("What the recipient can check, and what each check does not show:")
+    print("  - --check: every file is the one dropped, byte for byte, and none was added or "
+          "removed. It does not show that the content is correct or who made it.")
+    if repro:
+        print("  - --reproduce: reruns the command on a copy and compares its output with the "
+              "expected values. It runs the box's code with the recipient's permissions; a "
+              "match does not show that the output was computed rather than stored, that the "
+              "method is right, or that it holds on other machines.")
+    if any(it.get("live_sha256") for it in kept):
+        print("  - --check-links: each pinned live page still serves the same bytes. A "
+              "change may only be a date or layout. Uses the network.")
+    if receipts_kept:
+        print("  - --check-receipts: what each registry answered when it was asked, replayed "
+              "offline. Registries do not sign their answers.")
+    print("  - --id and --verify-provenance: the drop's digests and, if the author signs a "
+          "provenance record, who vouches for it. Author identifiers are as written"
+          + ("; the receipts show what the registries said about them." if receipts_kept
+             else "; nothing was looked up in a registry."))
+    print("  - --audit runs all of the above that apply in one pass, except --reproduce.")
+    print("")
+    if held and not out:
+        print("To write it: add --out NEW_FOLDER. A drop that holds anything back is written "
+              "as a clean copy, so nothing held back sits beside what is shared.")
+    refusals = []
+    if strict and hits:
+        refusals.append("watch words were found")
+    if strict and unscanned and not allow_unscanned:
+        refusals.append("some files could not be scanned (--allow-unscanned after checking "
+                        "them by eye)")
+    if refusals:
+        print("--strict would refuse this drop: " + "; ".join(refusals) + ".")
+        return 1
+    return 0
+
 
 def parse(argv):
     p = argparse.ArgumentParser(
@@ -2046,6 +2186,9 @@ def parse(argv):
     p.add_argument("--allow-unscanned", action="store_true",
                    help="with --strict: accept files that could not be scanned for watch "
                         "words (PDFs, images), after checking them by eye")
+    p.add_argument("--preview", action="store_true",
+                   help="with --for: show what the drop would give its readers, what it "
+                        "leaves out and what each check shows, writing nothing")
     p.add_argument("--check", action="store_true",
                    help="compare a dropped box with its manifests; exit 0 match, 1 difference, "
                         "2 no manifest or no tag manifest (incomplete check)")
@@ -2125,6 +2268,12 @@ def parse(argv):
                    help="check a signed provenance record against this drop; exit 0 "
                         "verified, 1 does not match, 2 could not check")
     args = p.parse_args(argv[1:])
+    if args.preview and (args.check or args.reproduce or args.id or args.audit
+                         or args.pin_links or args.check_links or args.lookup
+                         or args.check_receipts or args.verify_report is not None
+                         or args.verify_provenance is not None):
+        p.error("--preview shows a drop before it is written; use it with --for, --out and "
+                "--strict only")
     if (args.links or args.summary is not None) and not args.audit:
         p.error("--links and --summary go with --audit")
     if args.audit:
@@ -2236,6 +2385,9 @@ def main(argv):
     box = json.loads((folder / "box.json").read_text(encoding="utf-8"))
 
     def refuse(message):
+        if args.preview:
+            sys.exit(f"Preview: this {audience} drop would be refused. {message} "
+                     "Nothing was written.")
         sys.exit(message + " Nothing was written.")
 
     def cleared(level):
@@ -2359,7 +2511,7 @@ def main(argv):
         held.append(f"field(s) outside the format ({', '.join(extra_fields)})")
     if receipts_held:
         held.append(f"{receipts_held} registry receipt(s)")
-    if held and not out:
+    if held and not out and not args.preview:
         refuse(f"This {audience} drop holds back {', '.join(held)}. Write it as a clean copy: "
                f"add --out <new folder>.")
 
@@ -2378,9 +2530,11 @@ def main(argv):
             if rel not in [r for _, r, _ in sums]:
                 sums.append((sha256(folder / rel), rel, (folder / rel).stat().st_size))
 
+    # A preview of a drop that holds something back shows the clean copy --out would write.
+    copying = bool(out) or (args.preview and bool(held))
     written = {}  # files the drop writes from memory instead of copying
     if receipts:
-        if out:
+        if copying:
             index = receipts_text(receipts_kept).encode("utf-8")
             written[RECEIPTS_INDEX] = index
             sums.append((hashlib.sha256(index).hexdigest(), RECEIPTS_INDEX, len(index)))
@@ -2459,6 +2613,9 @@ def main(argv):
     if left_out:
         lines += ["", f"{len(left_out)} item(s) were left out because they are not cleared for "
                       f"{LABELS[audience]} readers."]
+    if receipts_held:
+        lines.append(f"{receipts_held} registry receipt(s) about those items were left out "
+                     "with them.")
     texts["BOX.md"] = "\n".join(lines) + "\n"
 
     graph = [
@@ -2551,7 +2708,7 @@ def main(argv):
         {"@context": "https://w3id.org/ro/crate/1.1/context", "@graph": graph},
         indent=2, ensure_ascii=False)
 
-    if out:
+    if copying:
         # The copy's box.json holds only fields of the format and only the kept items, with
         # state lines as written, so a later export from the copy keeps every label.
         keep_settings = audience != "shareable"
@@ -2609,6 +2766,16 @@ def main(argv):
         return "; ".join(f'{name} line {line}: {term} ("...{context}...")'
                          for term, line, context in found)
 
+    if args.preview:
+        sys.exit(preview(
+            box=box, audience=audience, out=out, held=held, kept=kept, left_out=left_out,
+            sums=sums, details=details, use_box=use_box, state=state, state_held=state_held,
+            repro=repro if repro_kept else None, repro_held=repro is not None and not repro_kept,
+            extra_fields=extra_fields, receipts_kept=receipts_kept,
+            receipts_held=receipts_held, receipts_stale=receipts_stale, texts=texts,
+            hits={n: describe(n, f) for n, f in hits.items()}, unscanned=unscanned,
+            scanned=bool(terms) and audience == "shareable", strict=args.strict,
+            allow_unscanned=args.allow_unscanned))
     if hits and args.strict:
         refuse("Strict mode: watch words found in "
                + "; ".join(describe(n, f) for n, f in hits.items()) + ".")

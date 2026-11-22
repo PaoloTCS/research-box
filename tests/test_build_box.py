@@ -2115,6 +2115,114 @@ class AuditSignatureTests(unittest.TestCase):
         self.assertIn("could not check reproduction report", r.stdout)
 
 
+class PreviewTests(unittest.TestCase):
+    """--preview: what a drop gives its readers and leaves out, writing nothing."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def listing(self):
+        return sorted((p.relative_to(self.tmp).as_posix(), p.stat().st_mtime_ns)
+                      for p in self.tmp.rglob("*"))
+
+    def test_preview_writes_nothing_and_needs_no_out(self):
+        before = self.listing()
+        r = run(self.box, "--for", "shareable", "--preview")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(before, self.listing())
+        self.assertIn("Nothing was written", r.stdout)
+        gets, rest = r.stdout.split("Left out:", 1)
+        self.assertIn("Results table", gets)
+        self.assertIn("Simulation", gets)
+        self.assertNotIn("Working notes", gets)
+        self.assertNotIn("Planning chat", gets)
+        self.assertNotIn("Prime numbers and addressing", gets)
+        self.assertIn("Working notes (Same assistant), Planning chat (Private)", rest)
+        self.assertIn("the box's own title, description, topics and state", rest)
+        self.assertIn("private_terms", rest)
+        self.assertIn("add --out NEW_FOLDER", r.stdout)
+        self.assertIn("Project Lantern", r.stdout)
+        self.assertIn("does not show that the content is correct", r.stdout)
+        self.assertIn("computed rather than stored", r.stdout)
+
+    def test_preview_matches_the_drop(self):
+        r = run(self.box, "--for", "shareable", "--preview")
+        out = self.tmp / "share"
+        self.assertEqual(run(self.box, "--for", "shareable", "--out", out).returncode, 0)
+        manifest = [line.split("  ", 1)[1]
+                    for line in (out / "manifest-sha256.txt").read_text().splitlines()]
+        for rel in manifest:
+            self.assertIn(f"{rel} (", r.stdout)
+        self.assertIn(f"{len(manifest)} file(s)", r.stdout)
+        said = [ln for ln in (out / "BOX.md").read_text().splitlines() if "left out" in ln]
+        self.assertEqual(len(said), 1)
+        self.assertIn(f'BOX.md says: "{said[0]}"', r.stdout)
+
+    def test_private_preview_keeps_everything(self):
+        r = run(self.box, "--preview")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("Left out: nothing.", r.stdout)
+        self.assertIn("Working notes", r.stdout)
+        self.assertIn("scanned only in shareable drops", r.stdout)
+        self.assertNotIn("--out NEW_FOLDER", r.stdout)
+        self.assertFalse((self.box / "BOX.md").exists())
+
+    def test_strict_preview_says_it_would_refuse(self):
+        before = self.listing()
+        r = run(self.box, "--for", "shareable", "--preview", "--strict")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("--strict would refuse this drop: watch words were found", r.stdout)
+        self.assertEqual(before, self.listing())
+
+    def test_refused_drop_is_named_as_such(self):
+        (self.box / "sheet" / "results.csv").unlink()
+        r = run(self.box, "--for", "shareable", "--preview")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Preview: this shareable drop would be refused", r.stderr)
+        self.assertIn("sheet/results.csv", r.stderr)
+        out = self.tmp / "busy"
+        out.mkdir()
+        (out / "old.txt").write_text("x")
+        (self.box / "sheet" / "results.csv").write_text("n\n")
+        r = run(self.box, "--for", "shareable", "--preview", "--out", out)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("is not empty", r.stderr)
+
+    def test_receipts_left_out_are_named(self):
+        bb = load_script()
+        data = json.loads((self.box / "box.json").read_text())
+        data["items"][0]["live"] = "https://doi.org/10.5555/12345678"
+        (self.box / "box.json").write_text(json.dumps(data))
+        bb.registry_get = lambda url, accept, timeout=None: (
+            200, DOI_HANDLE if "/api/handles/" in url else DOI_CSL, None)
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bb.lookup_receipts(self.box), 0)
+        r = run(self.box, "--for", "shareable", "--preview")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("2 registry receipt(s) about items left out", r.stdout)
+        self.assertNotIn("registry receipt(s)\n", r.stdout.split("Left out:")[0])
+        r = run(self.box, "--for", "same-assistant", "--preview")
+        self.assertIn("- 2 registry receipt(s)", r.stdout.split("Left out:")[0])
+        self.assertIn("--check-receipts", r.stdout)
+        out = self.tmp / "share"
+        self.assertEqual(run(self.box, "--for", "shareable", "--out", out).returncode, 0)
+        self.assertIn("2 registry receipt(s) about those items were left out",
+                      (out / "BOX.md").read_text())
+
+    def test_preview_options(self):
+        for extra in (["--check"], ["--reproduce"], ["--id"], ["--audit"], ["--lookup"]):
+            r = run(self.box, "--preview", *extra)
+            self.assertEqual(r.returncode, 2, extra)
+            self.assertIn("usage:", r.stderr)
+
+
 class DiffReportTests(unittest.TestCase):
     """A rerun that does not reproduce says which output and key missed, and by how much."""
 

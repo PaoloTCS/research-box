@@ -70,7 +70,7 @@ Add an Items row. A file with no live object gets its file name under "Snapshot 
    - `manifest-sha256.txt`, checksums of every snapshot file, so a later reader can tell whether a file changed;
    - `tagmanifest-sha256.txt`, checksums of the files above, so a stale or edited `BOX.md` or `box.json` is caught too.
    If the box declares a `reproduce` command, the script checks it too: its paths must stay inside the box, and every file it runs or reads must be in the drop, or the drop is refused.
-   Use `--for <audience> --out <new folder>`: the clean copy holds only the cleared files and a `box.json` filtered to them, so nothing held back sits in the folder. The script refuses a drop that holds anything back unless `--out` is given. If the script cannot run, write the same files by hand.
+   Use `--for <audience> --out <new folder>`: the clean copy holds only the cleared files and a `box.json` filtered to them, so nothing held back sits in the folder. The script refuses a drop that holds anything back unless `--out` is given. Before a drop for anyone but the user, run the same command with `--preview` instead of `--out`: it writes nothing and lists what the readers will get, what is left out and what each check shows; tell the user in a line or two what leaves and what stays. If the script cannot run, write the same files by hand.
 5. **Copy, verify and record.** Copy the clean folder to the location and run `--check` there; a copy is not done until the check passes at the destination. Then update Last dropped and Drop location in the registry. The registry keeps the full item list; a drop's `box.json` lists only what that drop holds.
 6. **Reply** in two or three lines: where it went, and anything left out and why.
 

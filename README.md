@@ -10,6 +10,7 @@ Say "make a box called prime-numbers", "add this sheet to the box", "drop the bo
 - **Checks:** `--check` tells you whether any file in a drop, including its own description, changed or was copied stale, and a list of watch words flags private terms that are about to leave in a shareable drop, including inside Word, Excel, PowerPoint and OpenDocument files.
 - **Reproduce:** a box can declare one command and what its output should be. Whoever opens the drop runs `--reproduce`: it checks the checksums, asks, runs the command on a temporary copy and reports whether the result reproduced, with numbers compared within stated tolerances or bounds.
 - **Registry receipts:** `--lookup` saves what ORCID, ISNI and doi.org answered about the identifiers a box names, response and SHA-256 included, and `--check-receipts` replays those answers offline, showing any registries that disagree.
+- **One-command audit:** `--audit` runs every check that applies to a drop (files, registry receipts, a signed provenance record, a signed reproduction report and, with `--links`, pinned pages) and prints one pass or fail table with one exit code, plus a JSON summary with `--summary`.
 - **Signed reproductions:** whoever reproduced a box can sign the JSON report with an SSH key, and `--verify-report` checks, without running anything, that a trusted key signed a report saying this exact drop reproduced.
 
 ## Quick demo
@@ -107,6 +108,8 @@ The skill tells the agent to run `research-box/scripts/build_box.py`, a Python s
 The one exception is `--reproduce`, which runs the command a box declares, and only after you confirm it. That command is the box author's code: it runs with your permissions on a temporary copy of the drop and can do anything you can, including use the network. Opening a box never runs it. For a box from someone you do not know, run it in a container or virtual machine. On Linux, `--no-network` runs it through `unshare` in a network namespace with no network; that cuts off the network, not your files.
 
 `--lookup` is the other network call: it asks public registries (ORCID's public API, the ISNI SRU service and doi.org) about the ORCID iDs, ISNIs and DOIs a box names, sending only those identifiers, and saves each answer under `receipts/` as a receipt. `--check-receipts` replays the saved receipts offline and makes no network calls.
+
+`--audit` runs nothing from the box and makes no network calls unless you add `--links`, which fetches pinned pages as `--check-links` does.
 
 `--id` and `--verify-provenance` only read the drop's files, and the latter calls `ssh-keygen` like `--verify-report`.
 

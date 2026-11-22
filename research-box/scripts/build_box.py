@@ -11,6 +11,9 @@ Usage:
   python3 build_box.py <dropped-box> --id [--provenance FILE]
   python3 build_box.py <dropped-box> --verify-provenance FILE --allowed-signers FILE
                        [--signer IDENTITY] [--signature FILE]
+  python3 build_box.py <dropped-box> --audit [--verify-provenance RECORD]
+                       [--verify-report REPORT] [--allowed-signers FILE] [--links]
+                       [--summary FILE]
   python3 build_box.py <box-folder> --lookup
   python3 build_box.py <box-folder> --check-receipts
   python3 build_box.py --help
@@ -83,6 +86,14 @@ Reads <box-folder>/box.json (format in references/box-format.md). Standard libra
           that disagree are shown, never resolved. Registries do not sign their answers, so
           a receipt shows what whoever looked it up saved. Exit status: 0 all hold, 1 one
           changed, is missing, was not found or disagrees, 2 no receipts.
+
+--audit   Run every check that applies to a dropped box in one pass and print one table:
+          --check, --check-receipts when the drop has receipts, --verify-provenance and
+          --verify-report when a record or report is given (with --allowed-signers, or
+          --attested-by for the report), and --check-links only with --links, which uses
+          the network. It runs nothing from the box. --summary FILE writes the result as JSON
+          (type research-box-audit/v1). Exit status: 0 every check that ran passed, 1 any
+          failed, 2 none failed but one could not be made.
 
 A drop is also refused, writing nothing, when a snapshot path leaves the box folder, a
 declared snapshot file is missing, one file is listed under items with different levels, or
@@ -1900,6 +1911,123 @@ def check_receipts(folder):
           "sign their answers. Run --lookup again to ask them now.")
     return 1 if bad or findings["problems"] or drop_status == 1 else 0
 
+# ---------------------------------------------------------------------------------------
+# One-command audit. --audit runs every check that applies to a drop, in one pass, and
+# gives one exit status a pipeline can gate on: the drop's files, its registry receipts
+# (when it has them), a signed provenance record and a signed reproduction report (when
+# given) and, only with --links, its pinned live pages. It runs nothing from the box.
+
+AUDIT_TYPE = "research-box-audit/v1"
+AUDIT_RESULTS = {0: "pass", 1: "fail", 2: "could not check"}
+
+
+def captured(function, *args):
+    """Run a check, keeping what it prints. Returns (exit status, printed text)."""
+    import contextlib
+    import io
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            status = function(*args)
+    except SystemExit as err:
+        status = err.code if isinstance(err.code, int) else 2
+        if not isinstance(err.code, int) and err.code:
+            buf.write(f"{err.code}\n")
+    except (OSError, ValueError, KeyError, TypeError) as err:
+        status = 2
+        buf.write(f"The check stopped: {err}\n")
+    return status, buf.getvalue()
+
+
+def audit(folder, args):
+    """Run every applicable check on a drop. Exit status: 0 every check that ran passed,
+    1 any check failed, 2 none failed but one could not be made."""
+    folder = Path(folder)
+    if args.summary is not None:
+        s = args.summary.resolve()
+        if s == folder.resolve() or folder.resolve() in s.parents:
+            print("--summary must be outside the drop, so the drop still matches its "
+                  "manifests. Nothing was checked.")
+            return 2
+    plan = [("drop files", check, (folder,))]
+    skipped = []
+    if (folder / RECEIPTS_INDEX).is_file():
+        plan.append(("registry receipts", check_receipts, (folder,)))
+    else:
+        skipped.append(("registry receipts", "the drop has none"))
+    if args.verify_provenance is not None:
+        plan.append(("provenance record", verify_provenance, (folder, args)))
+    else:
+        skipped.append(("provenance record", "none given (--verify-provenance RECORD)"))
+    if args.verify_report is not None:
+        plan.append(("reproduction report", verify_report, (folder, args)))
+    else:
+        skipped.append(("reproduction report", "none given (--verify-report REPORT)"))
+    pinned = False
+    try:
+        box = json.loads((folder / "box.json").read_text(encoding="utf-8"))
+        pinned = any(it.get("live_sha256") for it in box.get("items", []))
+    except (OSError, ValueError, AttributeError):
+        box = {}
+    if args.links:
+        plan.append(("live pages", check_links, (folder,)))
+    else:
+        skipped.append(("live pages", "pinned pages not fetched (--links uses the network)"
+                        if pinned else "not asked (--links)"))
+
+    print(f"Audit of {folder}: {len(plan)} check(s)"
+          + (", using the network for live pages" if args.links else ", no network") + ".")
+    rows = []
+    for name, function, call in plan:
+        status, text = captured(function, *call)
+        print(f"\n== {name} ==")
+        for line in text.rstrip().splitlines():
+            print(f"  {line}")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        detail = lines[-1] if lines else ""
+        rows.append({"check": name, "result": AUDIT_RESULTS.get(status, "could not check"),
+                     "exit": status if status in AUDIT_RESULTS else 2, "detail": detail})
+    for name, why in skipped:
+        rows.append({"check": name, "result": "skipped", "exit": None, "detail": why})
+
+    exits = [r["exit"] for r in rows if r["exit"] is not None]
+    overall = 1 if 1 in exits else 2 if 2 in exits else 0
+    width = max(len(r["check"]) for r in rows)
+    print()
+    print("Check".ljust(width + 2) + "Result")
+    for r in rows:
+        detail = r["detail"] if len(r["detail"]) <= 100 else r["detail"][:97] + "..."
+        shown = "FAIL" if r["result"] == "fail" else r["result"]
+        print(f"{r['check'].ljust(width + 2)}{shown:<16}{detail}")
+    failed = [r["check"] for r in rows if r["exit"] == 1]
+    unsure = [r["check"] for r in rows if r["exit"] == 2]
+    if overall == 0:
+        print(f"Audit: pass. Every check that ran passed (exit 0).")
+    elif overall == 1:
+        print(f"Audit: FAIL ({', '.join(failed)}; exit 1).")
+    else:
+        print(f"Audit: incomplete; could not check {', '.join(unsure)} (exit 2).")
+    print("The audit runs nothing from the box: --reproduce reruns its command. Skipped "
+          "checks prove nothing either way.")
+
+    if args.summary is not None:
+        summary = {"type": AUDIT_TYPE, "tool": f"research-box {VERSION}",
+                   "checked": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                   "box": box.get("box", "") if isinstance(box, dict) else "",
+                   "network": bool(args.links), "result": AUDIT_RESULTS[overall],
+                   "exit": overall, "checks": rows}
+        if rows[0]["exit"] == 0:
+            try:
+                summary["content_id"] = content_id(folder)
+                summary["drop_id"] = "sha256:" + sha256(folder / "tagmanifest-sha256.txt")
+            except OSError:
+                pass
+        args.summary.parent.mkdir(parents=True, exist_ok=True)
+        args.summary.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+                                encoding="utf-8", newline="\n")
+        print(f"Summary written to {args.summary}.")
+    return overall
+
 
 def parse(argv):
     p = argparse.ArgumentParser(
@@ -1976,6 +2104,16 @@ def parse(argv):
                    help="replay the saved registry receipts offline: each saved response "
                         "must match its digest and give the recorded answer; exit 0 all "
                         "hold, 1 changed, not found or disagreeing, 2 no receipts")
+    p.add_argument("--audit", action="store_true",
+                   help="run every check that applies to a dropped box in one pass: its files, "
+                        "its registry receipts, and the --verify-provenance record and "
+                        "--verify-report report if given; one table, one exit status (0 all "
+                        "passed, 1 one failed, 2 one could not be made); runs nothing from the "
+                        "box")
+    p.add_argument("--links", action="store_true",
+                   help="with --audit: also fetch the pinned live pages (uses the network)")
+    p.add_argument("--summary", type=Path, metavar="FILE",
+                   help="with --audit: write the result as JSON here (outside the drop)")
     p.add_argument("--id", action="store_true",
                    help="print a dropped box's portable identifiers: its content id and "
                         "drop id (SHA-256 digests), author identifiers and the drop it "
@@ -1987,6 +2125,17 @@ def parse(argv):
                    help="check a signed provenance record against this drop; exit 0 "
                         "verified, 1 does not match, 2 could not check")
     args = p.parse_args(argv[1:])
+    if (args.links or args.summary is not None) and not args.audit:
+        p.error("--links and --summary go with --audit")
+    if args.audit:
+        if args.check or args.reproduce or args.id or args.pin_links or args.check_links \
+                or args.lookup or args.check_receipts or args.out or args.strict \
+                or args.audience != "private":
+            p.error("--audit runs every check itself; use it without --check, --reproduce, "
+                    "--id, the link and receipt commands, --for, --out or --strict")
+        if args.signature is not None:
+            p.error("--signature does not go with --audit: the report's and the record's "
+                    "signatures are read from REPORT.sig and RECORD.sig")
     alone = [args.pin_links, args.check_links, args.lookup, args.check_receipts]
     if any(alone):
         if sum(map(bool, alone)) > 1 or args.check or args.reproduce or args.id \
@@ -2004,7 +2153,8 @@ def parse(argv):
     if args.verify_provenance is not None:
         if args.allowed_signers is None:
             p.error("--verify-provenance needs --allowed-signers FILE")
-        if (args.check or args.reproduce or args.verify_report is not None or args.out
+        if not args.audit and (
+                args.check or args.reproduce or args.verify_report is not None or args.out
                 or args.strict or args.log_proof is not None or args.log_signers is not None
                 or args.attested_by is not None or args.audience != "private"):
             p.error("--verify-provenance checks a dropped box on its own; use it without "
@@ -2026,7 +2176,10 @@ def parse(argv):
         p.error("--signer-workflow takes OWNER/REPO/.github/workflows/FILE.yml")
     if args.attested_by is not None and args.verify_report is None:
         p.error("--attested-by goes with --verify-report")
-    if args.attested_by is not None and any(v is not None for v in verify_only):
+    # In an audit with a provenance record, --allowed-signers and --signer are the record's.
+    report_only = verify_only[2:] if args.audit and args.verify_provenance is not None \
+        else verify_only
+    if args.attested_by is not None and any(v is not None for v in report_only):
         p.error("--attested-by replaces --allowed-signers, --signer, --signature, "
                 "--log-proof and --log-signers; the attestation's log is Sigstore's")
     if args.attested_by is not None and not re.fullmatch(r"[\w.-]+/[\w.-]+",
@@ -2057,6 +2210,8 @@ def parse(argv):
 def main(argv):
     args = parse(argv)
     folder = args.folder
+    if args.audit:
+        sys.exit(audit(folder, args))
     if args.check:
         sys.exit(check(folder))
     if args.reproduce:

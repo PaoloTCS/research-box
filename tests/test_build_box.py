@@ -1922,6 +1922,199 @@ class ReceiptTests(unittest.TestCase):
                 self.assertIn("run on their own", r.stderr)
 
 
+class AuditTests(unittest.TestCase):
+    """--audit: every applicable check on a drop, one table, one exit status."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+        self.out = self.tmp / "drop"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def drop(self):
+        r = run(self.box, "--for", "shareable", "--out", self.out)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def rows(self, stdout):
+        table = stdout.split("\nCheck ", 1)[1].splitlines()[1:]
+        return {line[:21].strip(): line[21:].split()[0] for line in table
+                if line and not line.startswith(("Audit:", "The audit", "Summary"))}
+
+    def test_clean_drop_passes_with_one_table(self):
+        self.drop()
+        summary = self.tmp / "audit.json"
+        r = run(self.out, "--audit", "--summary", summary)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("no network", r.stdout)
+        self.assertEqual(self.rows(r.stdout), {
+            "drop files": "pass", "registry receipts": "skipped",
+            "provenance record": "skipped", "reproduction report": "skipped",
+            "live pages": "skipped"})
+        self.assertIn("Audit: pass", r.stdout)
+        data = json.loads(summary.read_text())
+        self.assertEqual(data["type"], "research-box-audit/v1")
+        self.assertEqual((data["result"], data["exit"], data["network"]), ("pass", 0, False))
+        self.assertEqual(data["box"], "prime-numbers")
+        ids = run(self.out, "--id").stdout
+        self.assertIn(data["content_id"], ids)
+        self.assertIn(data["drop_id"], ids)
+        self.assertEqual([c["check"] for c in data["checks"]][0], "drop files")
+        self.assertIsNone(data["checks"][1]["exit"])
+
+    def test_edited_drop_fails(self):
+        self.drop()
+        (self.out / "sheet" / "results.csv").write_text("edited\n")
+        summary = self.tmp / "audit.json"
+        r = run(self.out, "--audit", "--summary", summary)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.rows(r.stdout)["drop files"], "FAIL")
+        self.assertIn("Audit: FAIL (drop files; exit 1)", r.stdout)
+        data = json.loads(summary.read_text())
+        self.assertEqual(data["result"], "fail")
+        self.assertNotIn("content_id", data)
+
+    def test_folder_without_manifests_is_incomplete(self):
+        r = run(self.box, "--audit")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(self.rows(r.stdout)["drop files"], "could")
+        self.assertIn("Audit: incomplete", r.stdout)
+
+    def test_summary_must_be_outside_the_drop(self):
+        self.drop()
+        r = run(self.out, "--audit", "--summary", self.out / "audit.json")
+        self.assertEqual(r.returncode, 2)
+        self.assertFalse((self.out / "audit.json").exists())
+        self.assertEqual(run(self.out, "--check").returncode, 0)
+
+    def test_receipts_are_replayed(self):
+        bb = load_script()
+        data = json.loads((self.box / "box.json").read_text())
+        data["author"] = "Josiah Carberry"
+        data["author_ids"] = [{"scheme": "orcid", "id": "0000-0002-1825-0097"}]
+        (self.box / "box.json").write_text(json.dumps(data))
+        bb.registry_get = lambda url, accept, timeout=None: (200, ORCID_PERSON, None)
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bb.lookup_receipts(self.box), 0)
+        self.drop()
+        r = run(self.out, "--audit")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual(self.rows(r.stdout)["registry receipts"], "pass")
+        index = json.loads((self.out / "receipts" / "receipts.json").read_text())
+        (self.out / index["receipts"][0]["response"]).write_bytes(b"{}")
+        r = run(self.out, "--audit")
+        self.assertEqual(r.returncode, 1)
+        rows = self.rows(r.stdout)
+        self.assertEqual((rows["drop files"], rows["registry receipts"]), ("FAIL", "FAIL"))
+
+    def test_pinned_pages_need_links(self):
+        web = PageServer()
+        try:
+            web.pages["/results"] = b"n,stretch\n1,2.84\n"
+            data = json.loads((self.box / "box.json").read_text())
+            data["items"][1]["live"] = web.base + "/results"
+            data["items"][0]["live"] = data["items"][3]["live"] = None
+            (self.box / "box.json").write_text(json.dumps(data))
+            env = local_env()
+            self.assertEqual(run_env(self.box, "--pin-links", env=env).returncode, 0)
+            self.drop()
+            r = run(self.out, "--audit")
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("pinned pages not fetched", r.stdout)
+            r = run_env(self.out, "--audit", "--links", env=env)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("using the network", r.stdout)
+            self.assertEqual(self.rows(r.stdout)["live pages"], "pass")
+            web.pages["/results"] = b"n,stretch\n1,9.99\n"
+            r = run_env(self.out, "--audit", "--links", env=env)
+            self.assertEqual(r.returncode, 1)
+            self.assertEqual(self.rows(r.stdout)["live pages"], "FAIL")
+        finally:
+            web.close()
+
+    def test_audit_options(self):
+        for extra in (["--check"], ["--reproduce"], ["--id"], ["--for", "shareable"],
+                      ["--check-receipts"], ["--pin-links"],
+                      ["--verify-report", "r.json", "--allowed-signers", "s",
+                       "--signature", "x.sig"]):
+            r = run(self.box, "--audit", *extra)
+            self.assertEqual(r.returncode, 2, extra)
+            self.assertIn("usage:", r.stderr)
+        for extra in (["--links"], ["--summary", "x.json"]):
+            r = run(self.box, "--check", *extra)
+            self.assertEqual(r.returncode, 2, extra)
+            self.assertIn("go with --audit", r.stderr)
+
+
+@unittest.skipUnless(SSH_KEYGEN, "ssh-keygen (OpenSSH 8.2 or later) is not installed")
+class AuditSignatureTests(unittest.TestCase):
+    """--audit with a signed provenance record and a signed reproduction report."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+        self.saved_tmpdir = os.environ.get("TMPDIR")
+        os.environ["TMPDIR"] = str(self.tmp)
+        self.out = self.tmp / "drop"
+        self.assertEqual(run(self.box, "--for", "shareable", "--out", self.out).returncode, 0)
+        self.report = self.tmp / "report.json"
+        r = run(self.out, "--reproduce", "--yes", "--report", self.report)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.record = self.tmp / "provenance.json"
+        self.assertEqual(run(self.out, "--id", "--provenance", self.record).returncode, 0)
+        self.key = self.tmp / "key_alice"
+        subprocess.run([SSH_KEYGEN, "-q", "-t", "ed25519", "-N", "", "-C", "alice",
+                        "-f", str(self.key)], check=True)
+        public = (self.tmp / "key_alice.pub").read_text().split()[:2]
+        self.signers = self.tmp / "allowed_signers"
+        self.signers.write_text('alice@example.org namespaces="research-box-report,'
+                                f'research-box-provenance" {" ".join(public)}\n')
+        for path, namespace in ((self.report, "research-box-report"),
+                                (self.record, "research-box-provenance")):
+            subprocess.run([SSH_KEYGEN, "-q", "-Y", "sign", "-f", str(self.key), "-n",
+                            namespace, str(path)], check=True, capture_output=True)
+
+    def tearDown(self):
+        if self.saved_tmpdir is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = self.saved_tmpdir
+        shutil.rmtree(self.tmp)
+
+    def audit(self, *extra):
+        return run(self.out, "--audit", "--verify-provenance", self.record, "--verify-report",
+                   self.report, "--allowed-signers", self.signers, *extra)
+
+    def test_everything_signed_passes(self):
+        summary = self.tmp / "audit.json"
+        r = self.audit("--summary", summary)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("3 check(s)", r.stdout)
+        results = {c["check"]: c["result"] for c in json.loads(summary.read_text())["checks"]}
+        self.assertEqual(results["provenance record"], "pass")
+        self.assertEqual(results["reproduction report"], "pass")
+        self.assertEqual(self.audit("--signer", "alice@example.org").returncode, 0)
+
+    def test_one_failing_check_fails_the_audit(self):
+        record = json.loads(self.record.read_text())
+        record["author"] = "Someone Else"
+        self.record.write_text(json.dumps(record))
+        r = self.audit()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Audit: FAIL (provenance record; exit 1)", r.stdout)
+
+    def test_missing_signature_is_incomplete(self):
+        Path(str(self.report) + ".sig").unlink()
+        r = self.audit()
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("could not check reproduction report", r.stdout)
+
+
 class DiffReportTests(unittest.TestCase):
     """A rerun that does not reproduce says which output and key missed, and by how much."""
 

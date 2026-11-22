@@ -9,6 +9,7 @@ Say "make a box called prime-numbers", "add this sheet to the box", "drop the bo
 - **Sharing levels:** private, same assistant, shareable. A drop for wider readers leaves out what is not cleared for them, writes a clean copy that holds nothing else, and says what it left out.
 - **Checks:** `--check` tells you whether any file in a drop, including its own description, changed or was copied stale, and a list of watch words flags private terms that are about to leave in a shareable drop, including inside Word, Excel, PowerPoint and OpenDocument files.
 - **Reproduce:** a box can declare one command and what its output should be. Whoever opens the drop runs `--reproduce`: it checks the checksums, asks, runs the command on a temporary copy and reports whether the result reproduced, with numbers compared within stated tolerances or bounds.
+- **Registry receipts:** `--lookup` saves what ORCID, ISNI and doi.org answered about the identifiers a box names, response and SHA-256 included, and `--check-receipts` replays those answers offline, showing any registries that disagree.
 - **Signed reproductions:** whoever reproduced a box can sign the JSON report with an SSH key, and `--verify-report` checks, without running anything, that a trusted key signed a report saying this exact drop reproduced.
 
 ## Quick demo
@@ -104,6 +105,8 @@ In Claude Code, the repository is also a plugin marketplace, so the skill instal
 The skill tells the agent to run `research-box/scripts/build_box.py`, a Python script that uses the standard library only. It reads and writes files in the box folder you name and in the `--out` folder, and nothing else. It sends nothing anywhere and never deletes files. It makes no network calls unless you ask for a link check: `--pin-links` and `--check-links` fetch the public web pages a box's items link to (plain GET requests, nothing sent but the request) to record or compare their SHA-256. The live links a box lists are opened by the agent with its own tools, not by the script.
 
 The one exception is `--reproduce`, which runs the command a box declares, and only after you confirm it. That command is the box author's code: it runs with your permissions on a temporary copy of the drop and can do anything you can, including use the network. Opening a box never runs it. For a box from someone you do not know, run it in a container or virtual machine. On Linux, `--no-network` runs it through `unshare` in a network namespace with no network; that cuts off the network, not your files.
+
+`--lookup` is the other network call: it asks public registries (ORCID's public API, the ISNI SRU service and doi.org) about the ORCID iDs, ISNIs and DOIs a box names, sending only those identifiers, and saves each answer under `receipts/` as a receipt. `--check-receipts` replays the saved receipts offline and makes no network calls.
 
 `--id` and `--verify-provenance` only read the drop's files, and the latter calls `ssh-keygen` like `--verify-report`.
 

@@ -11,6 +11,8 @@ Usage:
   python3 build_box.py <dropped-box> --id [--provenance FILE]
   python3 build_box.py <dropped-box> --verify-provenance FILE --allowed-signers FILE
                        [--signer IDENTITY] [--signature FILE]
+  python3 build_box.py <box-folder> --lookup
+  python3 build_box.py <box-folder> --check-receipts
   python3 build_box.py --help
 
 Reads <box-folder>/box.json (format in references/box-format.md). Standard library only.
@@ -65,6 +67,23 @@ Reads <box-folder>/box.json (format in references/box-format.md). Standard libra
           manifests, an allowed key signed the record, and every identifier in it is the
           drop's own. Exit status: 0 verified, 1 does not match, 2 could not check.
 
+--lookup  Ask the registries about every ORCID iD and ISNI in author_ids and every DOI an
+          item links to (live: https://doi.org/10... or doi:10...), and save each answer as
+          a receipt under receipts/: the claim, the registry and address asked, the time, the
+          HTTP status, the response saved byte for byte, its SHA-256 and the answer read
+          from it. DOIs are asked of doi.org twice (the handle record and the citation
+          metadata), so a disagreement shows. Uses the network; nothing is sent but the
+          identifiers. A drop carries the receipts in its manifests, author receipts always
+          and a DOI receipt only with its item. Exit status: 0 every claim found and the
+          registries agree, 1 a claim not found, registries disagree or one gave no answer,
+          2 nothing to look up.
+--check-receipts
+          Replay the receipts offline: each saved response must match its SHA-256, have come
+          from the registry's own address and still give the recorded answer; registries
+          that disagree are shown, never resolved. Registries do not sign their answers, so
+          a receipt shows what whoever looked it up saved. Exit status: 0 all hold, 1 one
+          changed, is missing, was not found or disagrees, 2 no receipts.
+
 A drop is also refused, writing nothing, when a snapshot path leaves the box folder, a
 declared snapshot file is missing, one file is listed under items with different levels, or
 a reproduce command uses a path outside the box or needs a file the drop does not hold.
@@ -86,6 +105,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zipfile
@@ -1474,6 +1494,412 @@ def check_links(folder):
           "only show a new date or layout; compare it with the snapshot before relying on it.")
     return 1 if changed or gone or drop_status == 1 else 0
 
+# ---------------------------------------------------------------------------------------
+# Registry receipts. An ORCID iD, ISNI or DOI in a box is a claim about the world outside
+# it. --lookup asks each claim's registry once and saves what it answered as a receipt:
+# the claim, the registry and address asked, the time, the HTTP status, the response
+# bytes in a file under receipts/ and their SHA-256, and the answer read from them.
+# --check-receipts replays the receipts offline: each saved response must still match its
+# digest and still give the recorded answer, and registries that disagree are shown.
+# --lookup is the only option here that uses the network.
+
+RECEIPTS_DIR = "receipts"
+RECEIPTS_INDEX = "receipts/receipts.json"
+RECEIPTS_TYPE = "research-box-receipts/v1"
+RECEIPTS_CLAIM = ("Each receipt records what a registry answered when it was asked, with the "
+                  "response saved byte for byte. Registries do not sign their answers, so a "
+                  "receipt shows what whoever made the lookup saved, not that the registry "
+                  "said it; asking the registry again shows whether its answer still holds.")
+RECEIPT_KEYS = ["claim", "item", "registry", "url", "asked", "status", "response",
+                "response_sha256", "answer"]
+RECEIPT_MAX_BYTES = 5 << 20
+# Per scheme: (registry name, address with {id}, Accept header). Every one is public and
+# needs no account or key.
+REGISTRIES = {
+    "orcid": [("orcid-public-api", "https://pub.orcid.org/v3.0/{id}/person",
+               "application/json")],
+    "isni": [("isni-sru", "https://isni.oclc.org/sru/?query=pica.isn+%3D+%22{id}%22"
+              "&operation=searchRetrieve&recordSchema=isni-b", "application/xml")],
+    "doi": [("doi-handle", "https://doi.org/api/handles/{id}", "application/json"),
+            ("doi-metadata", "https://doi.org/{id}", "application/vnd.citationstyles.csl+json")],
+}
+REGISTRY_URLS = {name: url for entries in REGISTRIES.values() for name, url, _ in entries}
+SCHEME_LABELS = {"orcid": "ORCID", "isni": "ISNI", "doi": "DOI"}
+DOI_LINK = re.compile(r"(?:https?://(?:dx\.)?doi\.org/|doi:)(10\.\d{4,9}/\S+)$", re.I)
+
+
+def doi_of(link):
+    """The DOI an item's live link names (https://doi.org/10..., doi:10...), or None."""
+    if not isinstance(link, str):
+        return None
+    m = DOI_LINK.match(link.strip())
+    return urllib.parse.unquote(m.group(1)) if m else None
+
+
+def claim_key(scheme, value):
+    """Claims compare by scheme and identifier, ignoring case and ISNI spacing."""
+    value = value.replace(" ", "") if scheme == "isni" else value
+    return scheme, value.upper()
+
+
+def box_claims(box):
+    """The registry claims a box makes: [(scheme, id, item name or None)]."""
+    claims = []
+    for entry in box.get("author_ids", []) or []:
+        if isinstance(entry, dict) and isinstance(entry.get("scheme"), str) \
+                and entry["scheme"].lower() in ("orcid", "isni") and isinstance(entry.get("id"), str):
+            scheme = entry["scheme"].lower()
+            value = entry["id"].replace(" ", "") if scheme == "isni" else entry["id"]
+            claims.append((scheme, value, None))
+    for it in box.get("items", []) or []:
+        doi = doi_of(it.get("live"))
+        if doi:
+            claims.append(("doi", doi, it.get("item")))
+    return claims
+
+
+def registry_url(registry, value):
+    return REGISTRY_URLS[registry].replace(
+        "{id}", urllib.parse.quote(value, safe="/:;()._-"))
+
+
+def registry_get(url, accept, timeout=LINK_TIMEOUT):
+    """GET a registry address. Returns (HTTP status, response bytes, None), or
+    (None, None, reason) when no answer came back."""
+    request = urllib.request.Request(url, headers={
+        "Accept": accept, "User-Agent": f"research-box/{VERSION} (registry receipt)"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read(RECEIPT_MAX_BYTES + 1)
+            status = response.status
+    except urllib.error.HTTPError as err:
+        status, body = err.code, err.read(RECEIPT_MAX_BYTES + 1)
+    except urllib.error.URLError as err:
+        return None, None, str(err.reason)
+    except (OSError, ValueError, http.client.HTTPException) as err:
+        return None, None, str(err) or type(err).__name__
+    if len(body) > RECEIPT_MAX_BYTES:
+        return None, None, f"answer larger than {RECEIPT_MAX_BYTES >> 20} MB"
+    return status, body, None
+
+
+def _local(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def read_answer(registry, status, body):
+    """What a saved response says, worked out from its bytes alone: {"found": True or
+    False, ...details}, or None when the response is not a definite answer."""
+    if status == 404:
+        return {"found": False}
+    if status != 200:
+        return None
+    try:
+        if registry == "isni-sru":
+            root = ET.fromstring(body)
+            count = next((el.text for el in root.iter() if _local(el.tag) == "numberOfRecords"),
+                         None)
+            if count is None or not count.strip().isdigit():
+                return None
+            answer = {"found": int(count) > 0}
+            if answer["found"]:
+                surname = next((el.text for el in root.iter()
+                                if _local(el.tag) == "surname" and el.text), None)
+                forename = next((el.text for el in root.iter()
+                                 if _local(el.tag) == "forename" and el.text), None)
+                name = " ".join(p.strip() for p in (forename, surname) if p)
+                if name:
+                    answer["name"] = name
+            return answer
+        data = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, ET.ParseError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if registry == "orcid-public-api":
+        name = data.get("name") or {}
+        def part(key):
+            v = name.get(key) if isinstance(name, dict) else None
+            return v.get("value") if isinstance(v, dict) and isinstance(v.get("value"), str) \
+                else None
+        full = part("credit-name") or " ".join(p for p in (part("given-names"),
+                                                           part("family-name")) if p)
+        return {"found": True, **({"name": full} if full else {})}
+    if registry == "doi-handle":
+        if data.get("responseCode") == 100:
+            return {"found": False}
+        if data.get("responseCode") != 1:
+            return None
+        url = next((v.get("data", {}).get("value") for v in data.get("values", [])
+                    if isinstance(v, dict) and v.get("type") == "URL"
+                    and isinstance(v.get("data"), dict)), None)
+        return {"found": True, **({"url": url} if isinstance(url, str) else {})}
+    if registry == "doi-metadata":
+        answer = {"found": True}
+        title = data.get("title")
+        if isinstance(title, list):
+            title = title[0] if title else None
+        if isinstance(title, str) and title.strip():
+            answer["title"] = title.strip()
+        authors = []
+        for a in data.get("author", []) if isinstance(data.get("author"), list) else []:
+            if isinstance(a, dict):
+                n = a.get("literal") or " ".join(p for p in (a.get("given"), a.get("family"))
+                                                 if isinstance(p, str))
+                if n:
+                    authors.append(n)
+        if authors:
+            answer["authors"] = authors[:20]
+        return answer
+    return None
+
+
+def answer_text(answer):
+    if answer is None:
+        return "no definite answer"
+    if not answer.get("found"):
+        return "not found"
+    details = [f"name {answer['name']}" if answer.get("name") else "",
+               f"title {answer['title']}" if answer.get("title") else "",
+               f"points to {answer['url']}" if answer.get("url") else ""]
+    return "found" + "".join(f", {d}" for d in details if d)
+
+
+def read_receipts(folder):
+    """The receipts index of a folder: (list of receipts, None), (None, None) when the
+    folder has none, or (None, reason) when it cannot be read."""
+    path = Path(folder) / RECEIPTS_INDEX
+    if not path.is_file():
+        return None, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as err:
+        return None, f"{RECEIPTS_INDEX} cannot be read ({err})"
+    if not isinstance(data, dict) or data.get("type") != RECEIPTS_TYPE \
+            or not isinstance(data.get("receipts"), list):
+        return None, f"{RECEIPTS_INDEX} is not a receipts index (type {RECEIPTS_TYPE})"
+    for i, r in enumerate(data["receipts"], 1):
+        why = receipt_problem(folder, r)
+        if why:
+            return None, f"{RECEIPTS_INDEX} receipt {i}: {why}"
+    return data["receipts"], None
+
+
+def receipt_problem(folder, r):
+    """Why a receipt is malformed, or None. Says nothing about whether it still holds."""
+    if not isinstance(r, dict):
+        return "not an object"
+    unknown = [k for k in r if k not in RECEIPT_KEYS]
+    if unknown:
+        return f"unknown field(s) {', '.join(unknown)}"
+    claim = r.get("claim")
+    if not isinstance(claim, dict) or claim.get("scheme") not in REGISTRIES \
+            or not isinstance(claim.get("id"), str) or not claim["id"]:
+        return "claim must be {\"scheme\": \"orcid\", \"isni\" or \"doi\", \"id\": ...}"
+    if r.get("registry") not in [n for n, _, _ in REGISTRIES[claim["scheme"]]]:
+        return f"registry {r.get('registry')!r} does not answer {claim['scheme']} claims"
+    if not isinstance(r.get("status"), int) or not isinstance(r.get("asked"), str) \
+            or not isinstance(r.get("url"), str):
+        return "status, asked and url are required"
+    rel = r.get("response")
+    if not isinstance(rel, str) or not rel.startswith(RECEIPTS_DIR + "/") \
+            or not inside(folder, rel):
+        return "response must be a file under receipts/"
+    if not isinstance(r.get("response_sha256"), str) \
+            or not re.fullmatch(r"[0-9a-f]{64}", r["response_sha256"]):
+        return "response_sha256 must be 64 lowercase hex digits"
+    if "item" in r and not isinstance(r["item"], str):
+        return "item must be the item's name"
+    if not isinstance(r.get("answer"), dict):
+        return "answer is required"
+    return None
+
+
+def receipts_text(receipts):
+    return json.dumps({"type": RECEIPTS_TYPE, "claim": RECEIPTS_CLAIM, "receipts": receipts},
+                      indent=2, ensure_ascii=False) + "\n"
+
+
+def lookup_receipts(folder):
+    """Ask each claim's registries and save receipts under receipts/. Exit status: 0 every
+    claim found and the registries agree, 1 a claim was not found, registries disagree or a
+    registry gave no answer (what did answer is saved), 2 nothing to look up."""
+    folder = Path(folder)
+    path = folder / "box.json"
+    if not path.is_file():
+        print(f"No box.json in {folder}: nothing to look up.")
+        return 2
+    box = json.loads(path.read_text(encoding="utf-8"))
+    claims = box_claims(box)
+    if not claims:
+        print("The box names no ORCID iD or ISNI in author_ids and no DOI as an item's live "
+              "link (https://doi.org/10...). Nothing was looked up.")
+        return 2
+    receipts, why = read_receipts(folder)
+    if why:
+        print(f"{why}. Nothing was looked up.")
+        return 2
+    receipts = receipts or []
+    (folder / RECEIPTS_DIR).mkdir(exist_ok=True)
+    unanswered, saved = 0, []
+    for scheme, value, item in claims:
+        for registry, _, accept in REGISTRIES[scheme]:
+            url = registry_url(registry, value)
+            asked = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            status, body, failure = registry_get(url, accept)
+            label = f"{SCHEME_LABELS[scheme]} {value}"
+            if status is None:
+                unanswered += 1
+                print(f"  no answer   {label} from {registry}: {failure}")
+                continue
+            answer = read_answer(registry, status, body)
+            if answer is None:
+                unanswered += 1
+                print(f"  no answer   {label} from {registry}: HTTP {status}, not a definite "
+                      "answer (not saved)")
+                continue
+            stamp = asked.replace("-", "").replace(":", "").replace("+0000", "Z")
+            stem = re.sub(r"[^A-Za-z0-9.-]+", "_", f"{scheme}-{value}")[:80]
+            ext = ".xml" if registry == "isni-sru" else ".json"
+            rel = f"{RECEIPTS_DIR}/{stem}-{registry}-{stamp}{ext}"
+            n = 2
+            while (folder / rel).exists():
+                rel = f"{RECEIPTS_DIR}/{stem}-{registry}-{stamp}-{n}{ext}"
+                n += 1
+            (folder / rel).write_bytes(body)
+            receipt = {"claim": {"scheme": scheme, "id": value}}
+            if item is not None:
+                receipt["item"] = item
+            receipt.update(registry=registry, url=url, asked=asked, status=status,
+                           response=rel, response_sha256=hashlib.sha256(body).hexdigest(),
+                           answer=answer)
+            receipts.append(receipt)
+            saved.append(receipt)
+            print(f"  saved       {label} from {registry}: {answer_text(answer)} ({rel})")
+    if saved:
+        (folder / RECEIPTS_INDEX).write_text(receipts_text(receipts), encoding="utf-8",
+                                             newline="\n")
+        print(f"{len(saved)} receipt(s) saved in {folder / RECEIPTS_INDEX}. Drop the box again "
+              "so its manifests cover them.")
+    findings = receipt_findings(box, [r for r in receipts if r in saved])
+    for line in findings["lines"]:
+        print(line)
+    if unanswered:
+        print(f"{unanswered} lookup(s) got no answer and were not saved.")
+    return 1 if unanswered or findings["problems"] else 0
+
+
+def receipt_findings(box, receipts):
+    """Compare the newest receipt from each registry for each claim the box makes.
+    Returns {"lines": [...], "problems": n, "notes": n, "unchecked": [claims]}."""
+    latest = {}
+    for r in receipts:
+        key = claim_key(r["claim"]["scheme"], r["claim"]["id"])
+        prev = latest.setdefault(key, {}).get(r["registry"])
+        if prev is None or r["asked"] >= prev["asked"]:
+            latest[key][r["registry"]] = r
+    lines, problems, notes, unchecked = [], 0, 0, []
+    author = (box.get("author") or "").strip()
+    for scheme, value, item in box_claims(box):
+        key = claim_key(scheme, value)
+        label = f"{SCHEME_LABELS[scheme]} {value}" + (f" ({item})" if item else "")
+        answers = latest.get(key)
+        if not answers:
+            unchecked.append(label)
+            lines.append(f"  not looked up  {label}")
+            continue
+        found = {reg: r["answer"].get("found") for reg, r in answers.items()}
+        if len(set(found.values())) > 1:
+            problems += 1
+            lines.append(f"  DISAGREE       {label}: " + "; ".join(
+                f"{reg} says {'found' if f else 'not found'} ({answers[reg]['asked']})"
+                for reg, f in sorted(found.items())))
+            continue
+        if not any(found.values()):
+            problems += 1
+            lines.append(f"  NOT FOUND      {label}: " + "; ".join(
+                f"{reg} ({r['asked']})" for reg, r in sorted(answers.items())))
+            continue
+        lines.append(f"  found          {label}: " + "; ".join(
+            f"{reg} {answer_text(r['answer'])[len('found, '):] or 'found'} ({r['asked']})"
+            for reg, r in sorted(answers.items())))
+        names = {r["answer"]["name"] for r in answers.values() if r["answer"].get("name")}
+        if scheme in ("orcid", "isni") and author and names and not any(
+                " ".join(n.casefold().split()) == " ".join(author.casefold().split())
+                for n in names):
+            notes += 1
+            lines.append(f"    note: the registry gives the name {', '.join(sorted(names))}; "
+                         f"the box gives the author as {author}. Names can be written "
+                         "differently; check that they are the same person.")
+    return {"lines": lines, "problems": problems, "notes": notes, "unchecked": unchecked}
+
+
+def replay_problem(folder, r):
+    """Why a receipt no longer holds against its saved response, as (word, detail), or
+    None when the saved bytes still give the recorded answer."""
+    file = Path(folder) / r["response"]
+    if not file.is_file():
+        return "MISSING", r["response"]
+    body = file.read_bytes()
+    if hashlib.sha256(body).hexdigest() != r["response_sha256"]:
+        return "CHANGED", f"{r['response']} no longer matches its SHA-256"
+    if r["url"] != registry_url(r["registry"], r["claim"]["id"]):
+        return "WRONG PLACE", f"asked {r['url']}, not the registry's address"
+    again = read_answer(r["registry"], r["status"], body)
+    if again != r["answer"]:
+        return "MISREAD", (f"the saved response says {answer_text(again)}; the receipt says "
+                           f"{answer_text(r['answer'])}")
+    return None
+
+
+def check_receipts(folder):
+    """Replay a box's registry receipts offline. Exit status: 0 every receipt replays and
+    every claim with receipts was found with registries agreeing (and the drop, if it has
+    manifests, matches them); 1 a saved response changed or is missing, gives another
+    answer than recorded, a claim was not found, registries disagree, or the drop does not
+    match; 2 no receipts to check."""
+    folder = Path(folder)
+    path = folder / "box.json"
+    if not path.is_file():
+        print(f"No box.json in {folder}: nothing to check.")
+        return 2
+    drop_status = 0
+    if (folder / "manifest-sha256.txt").is_file():
+        print("Checking the drop against its manifests first.")
+        drop_status = check(folder)
+        if drop_status == 1:
+            print("The drop does not match its manifests, so its receipts may have been "
+                  "edited; they are replayed as the folder holds them now.")
+    receipts, why = read_receipts(folder)
+    if why:
+        print(f"{why}. Not checked.")
+        return 1
+    if not receipts:
+        print("The box has no registry receipts. Make them with --lookup before the drop.")
+        return 2
+    box = json.loads(path.read_text(encoding="utf-8"))
+    claims = {claim_key(s, v) for s, v, _ in box_claims(box)}
+    bad, good, stale = 0, [], 0
+    for r in receipts:
+        label = f"{SCHEME_LABELS[r['claim']['scheme']]} {r['claim']['id']} from {r['registry']}"
+        why = replay_problem(folder, r)
+        if why:
+            bad += 1
+            print(f"  {why[0]:<12} {label}: {why[1]}")
+            continue
+        if claim_key(r["claim"]["scheme"], r["claim"]["id"]) not in claims:
+            stale += 1
+        good.append(r)
+    print(f"Replayed {len(receipts)} receipt(s): {len(good)} match their saved responses"
+          + (f", {bad} do not" if bad else "")
+          + (f", {stale} for claims the box no longer makes" if stale else "") + ".")
+    findings = receipt_findings(box, good)
+    for line in findings["lines"]:
+        print(line)
+    print("A receipt shows what was saved when the registry was asked; registries do not "
+          "sign their answers. Run --lookup again to ask them now.")
+    return 1 if bad or findings["problems"] or drop_status == 1 else 0
+
 
 def parse(argv):
     p = argparse.ArgumentParser(
@@ -1541,6 +1967,15 @@ def parse(argv):
                    help="fetch every pinned live page again and report which changed or "
                         "cannot be reached; uses the network; exit 0 all unchanged, 1 changed "
                         "or unreachable, 2 none pinned")
+    p.add_argument("--lookup", action="store_true",
+                   help="ask the registries about each ORCID iD and ISNI in author_ids and "
+                        "each DOI an item links to, and save their answers as receipts under "
+                        "receipts/; uses the network; exit 0 all found, 1 not found, "
+                        "disagreeing or unanswered, 2 nothing to look up")
+    p.add_argument("--check-receipts", action="store_true",
+                   help="replay the saved registry receipts offline: each saved response "
+                        "must match its digest and give the recorded answer; exit 0 all "
+                        "hold, 1 changed, not found or disagreeing, 2 no receipts")
     p.add_argument("--id", action="store_true",
                    help="print a dropped box's portable identifiers: its content id and "
                         "drop id (SHA-256 digests), author identifiers and the drop it "
@@ -1552,12 +1987,13 @@ def parse(argv):
                    help="check a signed provenance record against this drop; exit 0 "
                         "verified, 1 does not match, 2 could not check")
     args = p.parse_args(argv[1:])
-    if args.pin_links or args.check_links:
-        if (args.pin_links and args.check_links) or args.check or args.reproduce or args.id \
+    alone = [args.pin_links, args.check_links, args.lookup, args.check_receipts]
+    if any(alone):
+        if sum(map(bool, alone)) > 1 or args.check or args.reproduce or args.id \
                 or args.verify_report is not None or args.verify_provenance is not None \
                 or args.out or args.strict or args.audience != "private":
-            p.error("--pin-links and --check-links each run on their own; use them without "
-                    "other commands, --for, --out or --strict")
+            p.error("--pin-links, --check-links, --lookup and --check-receipts each run on "
+                    "their own; use them without other commands, --for, --out or --strict")
     if args.provenance is not None and not args.id:
         p.error("--provenance goes with --id")
     if args.id and (args.check or args.reproduce or args.verify_report is not None
@@ -1631,6 +2067,10 @@ def main(argv):
         sys.exit(pin_links(folder))
     if args.check_links:
         sys.exit(check_links(folder))
+    if args.lookup:
+        sys.exit(lookup_receipts(folder))
+    if args.check_receipts:
+        sys.exit(check_receipts(folder))
     if args.id:
         sys.exit(show_id(folder, args))
     if args.verify_provenance is not None:
@@ -1714,6 +2154,36 @@ def main(argv):
                        "reproduce block a narrower sharing level.")
             repro = dict(repro, sharing=repro_level)
 
+    # Registry receipts (receipts/receipts.json, written by --lookup) travel with the claims
+    # they are about: author identifiers always, a DOI only with its item. Each must still
+    # give its recorded answer from its saved response, or the drop is refused.
+    receipts, why = read_receipts(folder)
+    if why:
+        refuse(why + ".")
+    receipts = receipts or []
+    receipts_kept, receipts_held, receipts_stale = [], 0, 0
+    if receipts:
+        clash = [rel for it in items for rel in it.get("snapshot", [])
+                 if PurePath(rel).parts[:1] == (RECEIPTS_DIR,)]
+        if clash:
+            refuse(f"{RECEIPTS_DIR}/ holds this box's registry receipts; no item may list a "
+                   f"snapshot there: {', '.join(clash)}.")
+        for i, r in enumerate(receipts, 1):
+            problem = replay_problem(folder, r)
+            if problem:
+                refuse(f"{RECEIPTS_INDEX} receipt {i} ({r['claim']['id']} from "
+                       f"{r['registry']}): {problem[1]}. Run --lookup again.")
+        kept_names = {it["item"] for it in kept}
+        making = {(claim_key(sc, v), it) for sc, v, it in box_claims(box)}
+        for r in receipts:
+            key = (claim_key(r["claim"]["scheme"], r["claim"]["id"]), r.get("item"))
+            if key not in making:
+                receipts_stale += 1
+            elif r.get("item") is None or r["item"] in kept_names:
+                receipts_kept.append(r)
+            else:
+                receipts_held += 1
+
     # Fields outside the format are never copied into a drop for other readers.
     extra_box = [k for k in box if k not in BOX_KEYS]
     extra_items = sorted({k for it in box["items"] for k in it if k not in ITEM_KEYS})
@@ -1732,6 +2202,8 @@ def main(argv):
         held.append("the box's own details")
     if extra_fields and audience != "private":
         held.append(f"field(s) outside the format ({', '.join(extra_fields)})")
+    if receipts_held:
+        held.append(f"{receipts_held} registry receipt(s)")
     if held and not out:
         refuse(f"This {audience} drop holds back {', '.join(held)}. Write it as a clean copy: "
                f"add --out <new folder>.")
@@ -1750,6 +2222,22 @@ def main(argv):
         for rel in it.get("snapshot", []):
             if rel not in [r for _, r, _ in sums]:
                 sums.append((sha256(folder / rel), rel, (folder / rel).stat().st_size))
+
+    written = {}  # files the drop writes from memory instead of copying
+    if receipts:
+        if out:
+            index = receipts_text(receipts_kept).encode("utf-8")
+            written[RECEIPTS_INDEX] = index
+            sums.append((hashlib.sha256(index).hexdigest(), RECEIPTS_INDEX, len(index)))
+            in_drop = receipts_kept
+        else:
+            sums.append((sha256(folder / RECEIPTS_INDEX), RECEIPTS_INDEX,
+                         (folder / RECEIPTS_INDEX).stat().st_size))
+            in_drop = receipts
+        for r in in_drop:
+            if r["response"] not in [rel for _, rel, _ in sums]:
+                sums.append((r["response_sha256"], r["response"],
+                             (folder / r["response"]).stat().st_size))
 
     # Everything the drop will say is built in memory first, so the watch-word check can
     # stop a strict drop before anything is written.
@@ -1800,6 +2288,14 @@ def main(argv):
                       "checksums, shows the command, asks before running it on a temporary "
                       "copy, and reports whether the result reproduced. Running it executes "
                       "this box's code with your permissions; it is not a sandbox."]
+    if receipts_kept:
+        shown = receipt_findings(dict(box, items=kept), receipts_kept)
+        lines += ["", "## Registry receipts", "",
+                  "What each registry answered when it was asked, saved under receipts/. "
+                  "`build_box.py <this folder> --check-receipts` replays them offline; "
+                  "registries do not sign their answers, so a receipt shows what was saved, "
+                  "not that the registry said it.", ""]
+        lines += ["- " + " ".join(line.split()) for line in shown["lines"]]
     lines += ["", "## Integrity", "",
               "manifest-sha256.txt holds a checksum of every snapshot file, and "
               "tagmanifest-sha256.txt covers this file, box.json and the RO-Crate description. "
@@ -1971,7 +2467,10 @@ def main(argv):
         out.mkdir(parents=True, exist_ok=True)
         for _, rel, _ in sums:
             (out / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(folder / rel, out / rel)
+            if rel in written:
+                (out / rel).write_bytes(written[rel])
+            else:
+                shutil.copy2(folder / rel, out / rel)
     for name in ("manifest-sha256.txt", "BOX.md", "ro-crate-metadata.json"):
         (target / name).write_text(texts[name], encoding="utf-8", newline="\n")
     if out:
@@ -1993,6 +2492,12 @@ def main(argv):
     if not use_box:
         print(f"Held back for {audience} readers: the box's own title, description, topics and "
               f"state" + (" (the public block was used instead)" if box.get("public") else ""))
+    if receipts_held:
+        print(f"Held back for {audience} readers: {receipts_held} registry receipt(s) about "
+              "items left out")
+    if receipts_stale and out:
+        print(f"Left out of the copy: {receipts_stale} registry receipt(s) for claims the box "
+              "no longer makes")
     if extra_fields and out:
         print("Fields outside the format, left out of the copy: " + ", ".join(extra_fields))
     for name, found in hits.items():

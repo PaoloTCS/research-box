@@ -21,6 +21,10 @@ from pathlib import Path
 
 RUNS = 3
 DEFAULT_WORKFLOW = ".github/workflows/rerun.yml"
+# The two files a reader needs to check a certificate. The workflows save the signature
+# bundle under this name next to the report, after this page is written.
+REPORT_FILE = "report.json"
+BUNDLE_FILE = "report.sigstore.json"
 HERE = Path(__file__).resolve().parent
 TOOL = HERE.parent.parent / "research-box" / "scripts" / "build_box.py"
 
@@ -121,9 +125,15 @@ def page(report, source):
 runner image {html.escape(str(r.get('runner_image')))}<br>
 workflow run <a href="{html.escape(r['workflow_run'])}">{html.escape(r['workflow_run'])}</a> at commit {html.escape(r['workflow_sha'])}<br>
 drop file {html.escape(source['url'])} (sha256 {html.escape(source['sha256'])})</p>
-<h2>Check it yourself</h2><pre>gh attestation verify report.json --repo {html.escape(r['repository'])} \\
+<h2>Files to check</h2><ul>
+<li><a href="{REPORT_FILE}">{REPORT_FILE}</a>: the signed report this page is drawn from</li>
+<li><a href="{BUNDLE_FILE}">{BUNDLE_FILE}</a>: its Sigstore signature bundle</li>
+</ul>
+<h2>Check it yourself</h2><p>Download both files and the drop, then:</p><pre>gh attestation verify report.json --repo {html.escape(r['repository'])} \\
   --signer-workflow {html.escape(signer)}
 python3 build_box.py DROP --verify-report report.json --attested-by {html.escape(r['repository'])}{flag}</pre>
+<p>With the bundle saved next to the report, <code>gh attestation verify</code> also takes
+<code>--bundle {BUNDLE_FILE}</code> and reads the signature from that file instead of from GitHub.</p>
 <p>The signature is GitHub's keyless signing through Sigstore, tied to the research-box
 rerun workflow {html.escape(signer)}, and recorded in Sigstore's public transparency log. It shows which workflow
 produced the report, not that the result is correct.</p>
@@ -208,7 +218,7 @@ def main(argv):
     if "differences" in report:
         report["runner"]["differences_from_run"] = differed
     args.out.mkdir(parents=True, exist_ok=True)
-    (args.out / "report.json").write_text(
+    (args.out / REPORT_FILE).write_text(
         json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
     (args.out / "certificate.html").write_text(
         page(report, report["runner"]["source"]), encoding="utf-8")

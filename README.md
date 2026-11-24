@@ -67,6 +67,9 @@ research-box/
 .claude-plugin/                plugin manifest and marketplace file
 docs/                          icon and demo recording
 .github/workflows/ci.yml       tests on Linux, macOS and Windows
+.github/workflows/rerun*.yml   the rerun service on GitHub Actions (see What it runs)
+.github/rerun/                 helper scripts for those workflows
+.github/ISSUE_TEMPLATE/        the rerun request form
 examples/prime-numbers/        a small box to try the script on
 tests/test_build_box.py        unittest suite, standard library only
 ```
@@ -75,7 +78,7 @@ tests/test_build_box.py        unittest suite, standard library only
 
 ## Try it
 
-The commands and the output in [Quick demo](#quick-demo) were run against this revision. To run the 74-test suite (Python 3.10 or later) (the 11 signature tests need `ssh-keygen` and are skipped without it):
+The commands and the output in [Quick demo](#quick-demo) were run against this revision. To run the 162-test suite (Python 3.10 or later; the 35 signature tests need `ssh-keygen` and are skipped without it):
 
 ```
 python3 -m unittest discover tests
@@ -108,6 +111,8 @@ The one exception is `--reproduce`, which runs the command a box declares, and o
 `--id` and `--verify-provenance` only read the drop's files, and the latter calls `ssh-keygen` like `--verify-report`.
 
 `--verify-report` runs nothing from the box. It calls the local `ssh-keygen` to check signatures (the report's, and with `--log-proof` the log checkpoint's) and makes no network calls.
+
+The `.github/` folder is not part of the skill. Its workflows and helper scripts run only on GitHub's servers, never on your computer: installing the skill or the plugin does not run them, and neither does the agent or the script. They run when something happens in a GitHub repository: a push or pull request in this one runs the tests (and, when it changes the rerun code, a test rerun that signs and publishes nothing); a rerun request issue or a maintainer starts a rerun here; and a repository that calls the reusable workflow `rerun-own.yml` runs it there, on its own box or a drop it names. A rerun downloads the drop archive from the https address given in the request (at most 50 MB, checked against its SHA-256), reruns the box on GitHub's runner with no network, and signs the report with GitHub's keyless attestation (Sigstore). Here the report is published to this repository's `certificates` branch and the request issue gets a reply; with `rerun-own.yml` it stays in the calling repository as a workflow artifact. `rerun-own.yml` also asks GitHub for its own OIDC token to learn which workflow is running.
 
 ## Versions
 

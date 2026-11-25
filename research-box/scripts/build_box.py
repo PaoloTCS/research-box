@@ -103,7 +103,7 @@ REPRO_KEYS = ["name", "command", "inputs", "requires", "timeout_seconds", "shari
 GENERATED = {"BOX.md", "box.json", "ro-crate-metadata.json", "manifest-sha256.txt",
              "tagmanifest-sha256.txt"}
 TAGGED = ["BOX.md", "box.json", "ro-crate-metadata.json", "manifest-sha256.txt"]
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 # What a reproduction report (and so a signature on it) can claim, and what it cannot.
 REPORT_CLAIM = ("Running these exact files with the declared command produced the declared "
                 "outputs within the declared tolerances. This does not show that the outputs "

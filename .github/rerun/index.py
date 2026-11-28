@@ -7,6 +7,17 @@ import sys
 from pathlib import Path
 
 
+BUNDLE_FILE = "report.sigstore.json"
+
+
+def files(entry):
+    """Direct links to the report and, when it was saved, its signature bundle."""
+    links = [f"<a href=\"{html.escape(entry['report'])}\">report</a>"]
+    if entry.get("bundle"):
+        links.append(f"<a href=\"{html.escape(entry['bundle'])}\">signature</a>")
+    return ", ".join(links)
+
+
 def main(argv):
     site = Path(argv[1])
     entries = []
@@ -15,20 +26,24 @@ def main(argv):
             report = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        entries.append({"path": path.parent.relative_to(site).as_posix() + "/",
+        folder = path.parent.relative_to(site).as_posix() + "/"
+        entries.append({"path": folder,
                         "box": report.get("box"), "verdict": report.get("verdict"),
-                        "drop_id": report.get("drop_id"), "started": report.get("started")})
+                        "drop_id": report.get("drop_id"), "started": report.get("started"),
+                        "report": folder + "report.json",
+                        "bundle": (folder + BUNDLE_FILE
+                                   if (path.parent / BUNDLE_FILE).is_file() else None)})
     entries.sort(key=lambda e: e.get("started") or "")
     (site / "index.json").write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
     rows = "".join(
         f"<tr><td><a href=\"{html.escape(e['path'])}certificate.html\">{html.escape(str(e['box']))}"
         f"</a></td><td>{html.escape(str(e['verdict']))}</td><td>{html.escape(str(e['started']))}"
-        f"</td></tr>" for e in reversed(entries))
+        f"</td><td>{files(e)}</td></tr>" for e in reversed(entries))
     (site / "index.html").write_text(
         "<!doctype html><meta charset=\"utf-8\"><title>research-box reruns</title>"
         "<h1>research-box reruns</h1><p>Each rerun ran a drop three times on GitHub Actions "
         "with no network, and its report is signed by the repository's rerun workflow "
-        "through Sigstore.</p><table><tr><th>Box</th><th>Verdict</th><th>Run</th></tr>"
+        "through Sigstore.</p><table><tr><th>Box</th><th>Verdict</th><th>Run</th><th>Files</th></tr>"
         f"{rows}</table><p><small>research-box is built with Claude, by Anthropic. Anthropic "
         "does not run or endorse these reruns.</small></p>\n", encoding="utf-8")
     # Cloudflare Pages reads _headers: no scripts or outside resources on these pages, and

@@ -140,6 +140,41 @@ class RerunTests(unittest.TestCase):
         self.assertIn("What differed (run 2)", page)
         self.assertIn("stdout (text): the text differs from line 1", page)
 
+    def test_certificate_links_its_two_verification_files(self):
+        out = self.tmp / "out-links"
+        self.assertEqual(self.assemble(self.runs, out).returncode, 0)
+        page = (out / "certificate.html").read_text()
+        # Relative links, so they resolve next to the page on the site and in a downloaded
+        # artifact alike.
+        self.assertIn('<a href="report.json">report.json</a>', page)
+        self.assertIn('<a href="report.sigstore.json">report.sigstore.json</a>', page)
+        self.assertIn("--bundle report.sigstore.json", page)
+        # The linked report is the file written next to the page.
+        self.assertTrue((out / "report.json").is_file())
+
+    def test_index_links_report_and_signature_when_present(self):
+        out = self.tmp / "out-index-links"
+        self.assemble(self.runs, out)
+        site = self.tmp / "site-links"
+        for run_id, signed in (("8", True), ("9", False)):
+            folder = site / "r" / run_id
+            folder.mkdir(parents=True)
+            for f in out.iterdir():
+                shutil.copy(f, folder / f.name)
+            if signed:
+                (folder / "report.sigstore.json").write_text("{}")
+        result = run(INDEX, site)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        page = (site / "index.html").read_text()
+        self.assertIn('<a href="r/8/report.json">report</a>', page)
+        self.assertIn('<a href="r/8/report.sigstore.json">signature</a>', page)
+        self.assertIn('<a href="r/9/report.json">report</a>', page)
+        # No link to a bundle that was never saved.
+        self.assertNotIn("r/9/report.sigstore.json", page)
+        entries = {e["path"]: e for e in json.loads((site / "index.json").read_text())}
+        self.assertEqual(entries["r/8/"]["bundle"], "r/8/report.sigstore.json")
+        self.assertIsNone(entries["r/9/"]["bundle"])
+
     def test_index_lists_reruns(self):
         out = self.tmp / "out-index"
         self.assemble(self.runs, out)

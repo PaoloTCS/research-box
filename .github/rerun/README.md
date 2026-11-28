@@ -24,6 +24,9 @@ workflow reruns the example box as a self-test and signs nothing.
 
 ## Checking a report
 
+Each certificate page links the two files you need, `report.json` and its Sigstore
+signature bundle `report.sigstore.json`, and the site index links them for every rerun.
+
 ```
 gh attestation verify report.json --repo PaoloTCS/research-box \
   --signer-workflow PaoloTCS/research-box/.github/workflows/rerun.yml

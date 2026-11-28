@@ -1638,6 +1638,591 @@ class LinkPinTests(unittest.TestCase):
         self.assertNotIn("pinned", (out / "BOX.md").read_text())
 
 
+ORCID_PERSON = json.dumps({"name": {"given-names": {"value": "Josiah"},
+                                    "family-name": {"value": "Carberry"},
+                                    "credit-name": None}}).encode()
+ISNI_SRU = (b'<?xml version="1.0"?><srw:searchRetrieveResponse '
+            b'xmlns:srw="http://www.loc.gov/zing/srw/"><srw:version>1.1</srw:version>'
+            b'<srw:numberOfRecords>1</srw:numberOfRecords><srw:records><srw:record>'
+            b'<srw:recordData><responseRecord><ISNIAssigned><ISNIMetadata><identity>'
+            b'<personOrFiction><personalName><surname>Carberry</surname>'
+            b'<forename>Josiah</forename></personalName></personOrFiction></identity>'
+            b'</ISNIMetadata></ISNIAssigned></responseRecord></srw:recordData></srw:record>'
+            b'</srw:records></srw:searchRetrieveResponse>')
+ISNI_NONE = (b'<srw:searchRetrieveResponse xmlns:srw="http://www.loc.gov/zing/srw/">'
+             b'<srw:numberOfRecords>0</srw:numberOfRecords></srw:searchRetrieveResponse>')
+DOI_HANDLE = json.dumps({"responseCode": 1, "handle": "10.5555/12345678", "values": [
+    {"index": 1, "type": "URL", "data": {"format": "string",
+                                         "value": "https://example.org/paper"}}]}).encode()
+DOI_MISSING = json.dumps({"responseCode": 100, "handle": "10.5555/12345678"}).encode()
+DOI_CSL = json.dumps({"title": "Toward a Unified Theory of High-Energy Metaphysics",
+                      "author": [{"given": "Josiah", "family": "Carberry"}],
+                      "DOI": "10.5555/12345678"}).encode()
+
+
+class ReceiptTests(unittest.TestCase):
+    """--lookup saves registry answers as receipts; --check-receipts replays them offline."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+        data = json.loads((self.box / "box.json").read_text())
+        data["author"] = "Josiah Carberry"
+        data["author_ids"] = [{"scheme": "orcid", "id": "0000-0002-1825-0097"},
+                              {"scheme": "isni", "id": "0000 0001 2146 438X"}]
+        data["items"][1]["live"] = "https://doi.org/10.5555/12345678"   # kept when shared
+        data["items"][0]["live"] = "doi:10.5555/private-notes"           # left out
+        (self.box / "box.json").write_text(json.dumps(data))
+        self.bb = load_script()
+        self.answers = {
+            "orcid-public-api": (200, ORCID_PERSON),
+            "isni-sru": (200, ISNI_SRU),
+            "doi-handle": (200, DOI_HANDLE),
+            "doi-metadata": (200, DOI_CSL),
+        }
+        self.asked = []
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def fake_get(self, url, accept, timeout=None):
+        self.asked.append(url)
+        for name, base in self.bb.REGISTRY_URLS.items():
+            if url.startswith(base.split("{id}")[0]) and (name != "doi-metadata"
+                                                          or "/api/handles/" not in url):
+                answer = self.answers[name]
+                if answer is None:
+                    return None, None, "connection refused"
+                return answer[0], answer[1], None
+        raise AssertionError(url)
+
+    def call(self, function, *args):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            status = function(*args)
+        return status, buf.getvalue()
+
+    def lookup(self):
+        self.bb.registry_get = self.fake_get
+        return self.call(self.bb.lookup_receipts, self.box)
+
+    def index(self, folder=None):
+        return json.loads(((folder or self.box) / "receipts" / "receipts.json").read_text())
+
+    def test_lookup_saves_a_receipt_per_claim_and_registry(self):
+        status, out = self.lookup()
+        self.assertEqual(status, 0, out)
+        index = self.index()
+        self.assertEqual(index["type"], "research-box-receipts/v1")
+        self.assertIn("do not sign", index["claim"])
+        receipts = index["receipts"]
+        self.assertEqual(sorted(r["registry"] for r in receipts),
+                         ["doi-handle", "doi-handle", "doi-metadata", "doi-metadata",
+                          "isni-sru", "orcid-public-api"])
+        orcid = next(r for r in receipts if r["registry"] == "orcid-public-api")
+        self.assertEqual(orcid["claim"], {"scheme": "orcid", "id": "0000-0002-1825-0097"})
+        self.assertEqual(orcid["url"],
+                         "https://pub.orcid.org/v3.0/0000-0002-1825-0097/person")
+        self.assertEqual(orcid["status"], 200)
+        self.assertEqual(orcid["answer"], {"found": True, "name": "Josiah Carberry"})
+        self.assertEqual((self.box / orcid["response"]).read_bytes(), ORCID_PERSON)
+        self.assertEqual(orcid["response_sha256"], hashlib.sha256(ORCID_PERSON).hexdigest())
+        self.assertNotIn("item", orcid)
+        isni = next(r for r in receipts if r["registry"] == "isni-sru")
+        self.assertEqual(isni["claim"]["id"], "000000012146438X")
+        self.assertIn("pica.isn+%3D+%22000000012146438X%22", isni["url"])
+        self.assertEqual(isni["answer"], {"found": True, "name": "Josiah Carberry"})
+        doi = next(r for r in receipts if r["registry"] == "doi-metadata"
+                   and r["claim"]["id"] == "10.5555/12345678")
+        self.assertEqual(doi["item"], "Results table")
+        self.assertEqual(doi["answer"]["authors"], ["Josiah Carberry"])
+        self.assertIn("High-Energy Metaphysics", doi["answer"]["title"])
+
+    def test_receipts_replay_offline(self):
+        self.lookup()
+        def no_network(*args, **kwargs):
+            raise AssertionError("network used")
+        self.bb.registry_get = no_network
+        import urllib.request
+        real, urllib.request.urlopen = urllib.request.urlopen, no_network
+        try:
+            status, out = self.call(self.bb.check_receipts, self.box)
+        finally:
+            urllib.request.urlopen = real
+        self.assertEqual(status, 0, out)
+        self.assertIn("6 match their saved responses", out)
+        self.assertIn("do not sign", out)
+        r = run(self.box, "--check-receipts")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_edited_response_or_answer_fails_the_replay(self):
+        self.lookup()
+        index = self.index()
+        orcid = next(r for r in index["receipts"] if r["registry"] == "orcid-public-api")
+        (self.box / orcid["response"]).write_bytes(ORCID_PERSON.replace(b"Josiah", b"Joseph"))
+        r = run(self.box, "--check-receipts")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("CHANGED", r.stdout)
+        (self.box / orcid["response"]).write_bytes(ORCID_PERSON)
+        orcid["answer"]["name"] = "Somebody Else"
+        (self.box / "receipts" / "receipts.json").write_text(json.dumps(index))
+        r = run(self.box, "--check-receipts")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("MISREAD", r.stdout)
+        self.assertIn("Josiah Carberry", r.stdout)
+
+    def test_receipt_must_name_the_registrys_own_address(self):
+        self.lookup()
+        index = self.index()
+        index["receipts"][0]["url"] = "https://registry.example/answer-anything"
+        (self.box / "receipts" / "receipts.json").write_text(json.dumps(index))
+        r = run(self.box, "--check-receipts")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("WRONG PLACE", r.stdout)
+
+    def test_not_found_is_saved_and_fails(self):
+        self.answers["isni-sru"] = (200, ISNI_NONE)
+        status, out = self.lookup()
+        self.assertEqual(status, 1)
+        self.assertIn("NOT FOUND", out)
+        isni = next(r for r in self.index()["receipts"] if r["registry"] == "isni-sru")
+        self.assertEqual(isni["answer"], {"found": False})
+        self.assertEqual(run(self.box, "--check-receipts").returncode, 1)
+
+    def test_disagreeing_registries_are_shown_not_resolved(self):
+        self.answers["doi-metadata"] = (404, b'{"message": "not found"}')
+        status, out = self.lookup()
+        self.assertEqual(status, 1)
+        self.assertIn("DISAGREE", out)
+        self.assertIn("doi-handle says found", out)
+        self.assertIn("doi-metadata says not found", out)
+
+    def test_newest_answer_from_each_registry_counts(self):
+        self.answers["doi-handle"] = (404, DOI_MISSING)
+        self.answers["doi-metadata"] = (404, b"{}")
+        self.assertEqual(self.lookup()[0], 1)
+        self.answers["doi-handle"] = (200, DOI_HANDLE)
+        self.answers["doi-metadata"] = (200, DOI_CSL)
+        status, out = self.lookup()
+        self.assertEqual(status, 0, out)
+        self.assertEqual(len(self.index()["receipts"]), 12)
+        self.assertEqual(run(self.box, "--check-receipts").returncode, 0)
+
+    def test_unanswered_lookup_is_not_saved(self):
+        self.answers["orcid-public-api"] = None
+        self.answers["isni-sru"] = (503, b"busy")
+        status, out = self.lookup()
+        self.assertEqual(status, 1)
+        self.assertIn("connection refused", out)
+        self.assertIn("2 lookup(s) got no answer", out)
+        registries = {r["registry"] for r in self.index()["receipts"]}
+        self.assertNotIn("orcid-public-api", registries)
+        self.assertNotIn("isni-sru", registries)
+
+    def test_differing_author_name_is_a_note(self):
+        self.answers["isni-sru"] = (200, ISNI_SRU.replace(b"Josiah", b"J."))
+        status, out = self.lookup()
+        self.assertEqual(status, 0, out)
+        self.assertIn("note: the registry gives the name J. Carberry", out)
+
+    def test_nothing_to_look_up_or_replay(self):
+        plain = self.tmp / "plain"
+        shutil.copytree(EXAMPLE, plain)
+        self.bb.registry_get = self.fake_get
+        self.assertEqual(self.call(self.bb.lookup_receipts, plain)[0], 2)
+        self.assertEqual(self.asked, [])
+        r = run(plain, "--check-receipts")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("no registry receipts", r.stdout)
+
+    def test_receipts_travel_with_their_claims(self):
+        self.lookup()
+        out = self.tmp / "share"
+        r = run(self.box, "--for", "shareable", "--out", out)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("Held back for shareable readers: 2 registry receipt(s)", r.stdout)
+        index = self.index(out)
+        self.assertEqual(len(index["receipts"]), 4)
+        self.assertNotIn("private-notes", json.dumps(index))
+        files = sorted(p.relative_to(out).as_posix() for p in (out / "receipts").iterdir())
+        self.assertEqual(len(files), 5)
+        manifest = (out / "manifest-sha256.txt").read_text()
+        for name in files:
+            self.assertIn(name, manifest)
+        box_md = (out / "BOX.md").read_text()
+        self.assertIn("## Registry receipts", box_md)
+        self.assertIn("ORCID 0000-0002-1825-0097", box_md)
+        self.assertNotIn("private-notes", box_md)
+        self.assertEqual(run(out, "--check").returncode, 0)
+        r = run(out, "--check-receipts")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        orcid = next(r for r in index["receipts"] if r["registry"] == "orcid-public-api")
+        (out / orcid["response"]).write_bytes(b"{}")
+        r = run(out, "--check-receipts")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("does not match its manifests", r.stdout)
+
+    def test_held_back_receipts_need_out(self):
+        self.lookup()
+        r = run(self.box, "--for", "shareable")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("registry receipt(s)", r.stderr)
+
+    def test_drop_refuses_an_edited_response(self):
+        self.lookup()
+        orcid = next(r for r in self.index()["receipts"] if r["registry"] == "orcid-public-api")
+        (self.box / orcid["response"]).write_bytes(b"{}")
+        r = run(self.box, "--for", "shareable", "--out", self.tmp / "share")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Run --lookup again", r.stderr)
+        self.assertFalse((self.tmp / "share").exists())
+
+    def test_private_drop_in_place_lists_every_receipt(self):
+        self.lookup()
+        r = run(self.box)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("does not list", r.stdout)
+        self.assertEqual(run(self.box, "--check").returncode, 0)
+        self.assertEqual(run(self.box, "--check-receipts").returncode, 0)
+
+    def test_boxes_without_receipts_drop_as_before(self):
+        plain = self.tmp / "plain"
+        shutil.copytree(EXAMPLE, plain)
+        out = self.tmp / "share"
+        self.assertEqual(run(plain, "--for", "shareable", "--out", out).returncode, 0)
+        self.assertFalse((out / "receipts").exists())
+        self.assertNotIn("receipts", (out / "manifest-sha256.txt").read_text())
+        self.assertNotIn("Registry receipts", (out / "BOX.md").read_text())
+
+    def test_doi_links(self):
+        self.assertEqual(self.bb.doi_of("https://doi.org/10.5555/12345678"), "10.5555/12345678")
+        self.assertEqual(self.bb.doi_of("http://dx.doi.org/10.1000/a%2Fb"), "10.1000/a/b")
+        self.assertEqual(self.bb.doi_of("doi:10.1000/xyz"), "10.1000/xyz")
+        self.assertIsNone(self.bb.doi_of("https://example.com/10.1000/xyz"))
+        self.assertIsNone(self.bb.doi_of(None))
+
+    def test_answers_are_read_from_the_bytes(self):
+        read = self.bb.read_answer
+        self.assertEqual(read("doi-handle", 200, DOI_HANDLE),
+                         {"found": True, "url": "https://example.org/paper"})
+        self.assertEqual(read("doi-handle", 404, DOI_MISSING), {"found": False})
+        self.assertEqual(read("isni-sru", 200, ISNI_NONE), {"found": False})
+        self.assertIsNone(read("orcid-public-api", 500, b""))
+        self.assertIsNone(read("orcid-public-api", 200, b"not json"))
+        self.assertIsNone(read("isni-sru", 200, b"<not-sru/>"))
+
+    def test_receipt_options_run_alone(self):
+        for first in ("--lookup", "--check-receipts"):
+            for extra in (["--check"], ["--pin-links"], ["--for", "shareable"]):
+                r = run(self.box, first, *extra)
+                self.assertEqual(r.returncode, 2, (first, extra))
+                self.assertIn("run on their own", r.stderr)
+
+
+class AuditTests(unittest.TestCase):
+    """--audit: every applicable check on a drop, one table, one exit status."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+        self.out = self.tmp / "drop"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def drop(self):
+        r = run(self.box, "--for", "shareable", "--out", self.out)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def rows(self, stdout):
+        table = stdout.split("\nCheck ", 1)[1].splitlines()[1:]
+        return {line[:21].strip(): line[21:].split()[0] for line in table
+                if line and not line.startswith(("Audit:", "The audit", "Summary"))}
+
+    def test_clean_drop_passes_with_one_table(self):
+        self.drop()
+        summary = self.tmp / "audit.json"
+        r = run(self.out, "--audit", "--summary", summary)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("no network", r.stdout)
+        self.assertEqual(self.rows(r.stdout), {
+            "drop files": "pass", "registry receipts": "skipped",
+            "provenance record": "skipped", "reproduction report": "skipped",
+            "live pages": "skipped"})
+        self.assertIn("Audit: pass", r.stdout)
+        data = json.loads(summary.read_text())
+        self.assertEqual(data["type"], "research-box-audit/v1")
+        self.assertEqual((data["result"], data["exit"], data["network"]), ("pass", 0, False))
+        self.assertEqual(data["box"], "prime-numbers")
+        ids = run(self.out, "--id").stdout
+        self.assertIn(data["content_id"], ids)
+        self.assertIn(data["drop_id"], ids)
+        self.assertEqual([c["check"] for c in data["checks"]][0], "drop files")
+        self.assertIsNone(data["checks"][1]["exit"])
+
+    def test_edited_drop_fails(self):
+        self.drop()
+        (self.out / "sheet" / "results.csv").write_text("edited\n")
+        summary = self.tmp / "audit.json"
+        r = run(self.out, "--audit", "--summary", summary)
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(self.rows(r.stdout)["drop files"], "FAIL")
+        self.assertIn("Audit: FAIL (drop files; exit 1)", r.stdout)
+        data = json.loads(summary.read_text())
+        self.assertEqual(data["result"], "fail")
+        self.assertNotIn("content_id", data)
+
+    def test_folder_without_manifests_is_incomplete(self):
+        r = run(self.box, "--audit")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(self.rows(r.stdout)["drop files"], "could")
+        self.assertIn("Audit: incomplete", r.stdout)
+
+    def test_summary_must_be_outside_the_drop(self):
+        self.drop()
+        r = run(self.out, "--audit", "--summary", self.out / "audit.json")
+        self.assertEqual(r.returncode, 2)
+        self.assertFalse((self.out / "audit.json").exists())
+        self.assertEqual(run(self.out, "--check").returncode, 0)
+
+    def test_receipts_are_replayed(self):
+        bb = load_script()
+        data = json.loads((self.box / "box.json").read_text())
+        data["author"] = "Josiah Carberry"
+        data["author_ids"] = [{"scheme": "orcid", "id": "0000-0002-1825-0097"}]
+        (self.box / "box.json").write_text(json.dumps(data))
+        bb.registry_get = lambda url, accept, timeout=None: (200, ORCID_PERSON, None)
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bb.lookup_receipts(self.box), 0)
+        self.drop()
+        r = run(self.out, "--audit")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual(self.rows(r.stdout)["registry receipts"], "pass")
+        index = json.loads((self.out / "receipts" / "receipts.json").read_text())
+        (self.out / index["receipts"][0]["response"]).write_bytes(b"{}")
+        r = run(self.out, "--audit")
+        self.assertEqual(r.returncode, 1)
+        rows = self.rows(r.stdout)
+        self.assertEqual((rows["drop files"], rows["registry receipts"]), ("FAIL", "FAIL"))
+
+    def test_pinned_pages_need_links(self):
+        web = PageServer()
+        try:
+            web.pages["/results"] = b"n,stretch\n1,2.84\n"
+            data = json.loads((self.box / "box.json").read_text())
+            data["items"][1]["live"] = web.base + "/results"
+            data["items"][0]["live"] = data["items"][3]["live"] = None
+            (self.box / "box.json").write_text(json.dumps(data))
+            env = local_env()
+            self.assertEqual(run_env(self.box, "--pin-links", env=env).returncode, 0)
+            self.drop()
+            r = run(self.out, "--audit")
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("pinned pages not fetched", r.stdout)
+            r = run_env(self.out, "--audit", "--links", env=env)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            self.assertIn("using the network", r.stdout)
+            self.assertEqual(self.rows(r.stdout)["live pages"], "pass")
+            web.pages["/results"] = b"n,stretch\n1,9.99\n"
+            r = run_env(self.out, "--audit", "--links", env=env)
+            self.assertEqual(r.returncode, 1)
+            self.assertEqual(self.rows(r.stdout)["live pages"], "FAIL")
+        finally:
+            web.close()
+
+    def test_audit_options(self):
+        for extra in (["--check"], ["--reproduce"], ["--id"], ["--for", "shareable"],
+                      ["--check-receipts"], ["--pin-links"],
+                      ["--verify-report", "r.json", "--allowed-signers", "s",
+                       "--signature", "x.sig"]):
+            r = run(self.box, "--audit", *extra)
+            self.assertEqual(r.returncode, 2, extra)
+            self.assertIn("usage:", r.stderr)
+        for extra in (["--links"], ["--summary", "x.json"]):
+            r = run(self.box, "--check", *extra)
+            self.assertEqual(r.returncode, 2, extra)
+            self.assertIn("go with --audit", r.stderr)
+
+
+@unittest.skipUnless(SSH_KEYGEN, "ssh-keygen (OpenSSH 8.2 or later) is not installed")
+class AuditSignatureTests(unittest.TestCase):
+    """--audit with a signed provenance record and a signed reproduction report."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+        self.saved_tmpdir = os.environ.get("TMPDIR")
+        os.environ["TMPDIR"] = str(self.tmp)
+        self.out = self.tmp / "drop"
+        self.assertEqual(run(self.box, "--for", "shareable", "--out", self.out).returncode, 0)
+        self.report = self.tmp / "report.json"
+        r = run(self.out, "--reproduce", "--yes", "--report", self.report)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.record = self.tmp / "provenance.json"
+        self.assertEqual(run(self.out, "--id", "--provenance", self.record).returncode, 0)
+        self.key = self.tmp / "key_alice"
+        subprocess.run([SSH_KEYGEN, "-q", "-t", "ed25519", "-N", "", "-C", "alice",
+                        "-f", str(self.key)], check=True)
+        public = (self.tmp / "key_alice.pub").read_text().split()[:2]
+        self.signers = self.tmp / "allowed_signers"
+        self.signers.write_text('alice@example.org namespaces="research-box-report,'
+                                f'research-box-provenance" {" ".join(public)}\n')
+        for path, namespace in ((self.report, "research-box-report"),
+                                (self.record, "research-box-provenance")):
+            subprocess.run([SSH_KEYGEN, "-q", "-Y", "sign", "-f", str(self.key), "-n",
+                            namespace, str(path)], check=True, capture_output=True)
+
+    def tearDown(self):
+        if self.saved_tmpdir is None:
+            os.environ.pop("TMPDIR", None)
+        else:
+            os.environ["TMPDIR"] = self.saved_tmpdir
+        shutil.rmtree(self.tmp)
+
+    def audit(self, *extra):
+        return run(self.out, "--audit", "--verify-provenance", self.record, "--verify-report",
+                   self.report, "--allowed-signers", self.signers, *extra)
+
+    def test_everything_signed_passes(self):
+        summary = self.tmp / "audit.json"
+        r = self.audit("--summary", summary)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("3 check(s)", r.stdout)
+        results = {c["check"]: c["result"] for c in json.loads(summary.read_text())["checks"]}
+        self.assertEqual(results["provenance record"], "pass")
+        self.assertEqual(results["reproduction report"], "pass")
+        self.assertEqual(self.audit("--signer", "alice@example.org").returncode, 0)
+
+    def test_one_failing_check_fails_the_audit(self):
+        record = json.loads(self.record.read_text())
+        record["author"] = "Someone Else"
+        self.record.write_text(json.dumps(record))
+        r = self.audit()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Audit: FAIL (provenance record; exit 1)", r.stdout)
+
+    def test_missing_signature_is_incomplete(self):
+        Path(str(self.report) + ".sig").unlink()
+        r = self.audit()
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("could not check reproduction report", r.stdout)
+
+
+class PreviewTests(unittest.TestCase):
+    """--preview: what a drop gives its readers and leaves out, writing nothing."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def listing(self):
+        return sorted((p.relative_to(self.tmp).as_posix(), p.stat().st_mtime_ns)
+                      for p in self.tmp.rglob("*"))
+
+    def test_preview_writes_nothing_and_needs_no_out(self):
+        before = self.listing()
+        r = run(self.box, "--for", "shareable", "--preview")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(before, self.listing())
+        self.assertIn("Nothing was written", r.stdout)
+        gets, rest = r.stdout.split("Left out:", 1)
+        self.assertIn("Results table", gets)
+        self.assertIn("Simulation", gets)
+        self.assertNotIn("Working notes", gets)
+        self.assertNotIn("Planning chat", gets)
+        self.assertNotIn("Prime numbers and addressing", gets)
+        self.assertIn("Working notes (Same assistant), Planning chat (Private)", rest)
+        self.assertIn("the box's own title, description, topics and state", rest)
+        self.assertIn("private_terms", rest)
+        self.assertIn("add --out NEW_FOLDER", r.stdout)
+        self.assertIn("Project Lantern", r.stdout)
+        self.assertIn("does not show that the content is correct", r.stdout)
+        self.assertIn("computed rather than stored", r.stdout)
+
+    def test_preview_matches_the_drop(self):
+        r = run(self.box, "--for", "shareable", "--preview")
+        out = self.tmp / "share"
+        self.assertEqual(run(self.box, "--for", "shareable", "--out", out).returncode, 0)
+        manifest = [line.split("  ", 1)[1]
+                    for line in (out / "manifest-sha256.txt").read_text().splitlines()]
+        for rel in manifest:
+            self.assertIn(f"{rel} (", r.stdout)
+        self.assertIn(f"{len(manifest)} file(s)", r.stdout)
+        said = [ln for ln in (out / "BOX.md").read_text().splitlines() if "left out" in ln]
+        self.assertEqual(len(said), 1)
+        self.assertIn(f'BOX.md says: "{said[0]}"', r.stdout)
+
+    def test_private_preview_keeps_everything(self):
+        r = run(self.box, "--preview")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("Left out: nothing.", r.stdout)
+        self.assertIn("Working notes", r.stdout)
+        self.assertIn("scanned only in shareable drops", r.stdout)
+        self.assertNotIn("--out NEW_FOLDER", r.stdout)
+        self.assertFalse((self.box / "BOX.md").exists())
+
+    def test_strict_preview_says_it_would_refuse(self):
+        before = self.listing()
+        r = run(self.box, "--for", "shareable", "--preview", "--strict")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("--strict would refuse this drop: watch words were found", r.stdout)
+        self.assertEqual(before, self.listing())
+
+    def test_refused_drop_is_named_as_such(self):
+        (self.box / "sheet" / "results.csv").unlink()
+        r = run(self.box, "--for", "shareable", "--preview")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Preview: this shareable drop would be refused", r.stderr)
+        self.assertIn("sheet/results.csv", r.stderr)
+        out = self.tmp / "busy"
+        out.mkdir()
+        (out / "old.txt").write_text("x")
+        (self.box / "sheet" / "results.csv").write_text("n\n")
+        r = run(self.box, "--for", "shareable", "--preview", "--out", out)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("is not empty", r.stderr)
+
+    def test_receipts_left_out_are_named(self):
+        bb = load_script()
+        data = json.loads((self.box / "box.json").read_text())
+        data["items"][0]["live"] = "https://doi.org/10.5555/12345678"
+        (self.box / "box.json").write_text(json.dumps(data))
+        bb.registry_get = lambda url, accept, timeout=None: (
+            200, DOI_HANDLE if "/api/handles/" in url else DOI_CSL, None)
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bb.lookup_receipts(self.box), 0)
+        r = run(self.box, "--for", "shareable", "--preview")
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertIn("2 registry receipt(s) about items left out", r.stdout)
+        self.assertNotIn("registry receipt(s)\n", r.stdout.split("Left out:")[0])
+        r = run(self.box, "--for", "same-assistant", "--preview")
+        self.assertIn("- 2 registry receipt(s)", r.stdout.split("Left out:")[0])
+        self.assertIn("--check-receipts", r.stdout)
+        out = self.tmp / "share"
+        self.assertEqual(run(self.box, "--for", "shareable", "--out", out).returncode, 0)
+        self.assertIn("2 registry receipt(s) about those items were left out",
+                      (out / "BOX.md").read_text())
+
+    def test_preview_options(self):
+        for extra in (["--check"], ["--reproduce"], ["--id"], ["--audit"], ["--lookup"]):
+            r = run(self.box, "--preview", *extra)
+            self.assertEqual(r.returncode, 2, extra)
+            self.assertIn("usage:", r.stderr)
+
+
 class DiffReportTests(unittest.TestCase):
     """A rerun that does not reproduce says which output and key missed, and by how much."""
 
@@ -1775,6 +2360,255 @@ class RepositoryTests(unittest.TestCase):
             self.assertIn("is not empty", r.stderr)
         finally:
             shutil.rmtree(tmp)
+
+
+class OrcidDoiTests(unittest.TestCase):
+    """author_orcid (with its sharing rule) and item DOIs: checked offline, normalized,
+    written into BOX.md and RO-Crate, caught by --check when hand-edited."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+        self.bb = load_script()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def edit_box(self, change, box=None):
+        path = (box or self.box) / "box.json"
+        data = json.loads(path.read_text())
+        change(data)
+        path.write_text(json.dumps(data))
+
+    def drop(self, audience="shareable", name="drop", box=None):
+        out = self.tmp / name
+        r = run(box or self.box, "--for", audience, "--out", out)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return out
+
+    def graph(self, out):
+        return json.loads((out / "ro-crate-metadata.json").read_text())["@graph"]
+
+    def root(self, out):
+        return next(e for e in self.graph(out) if e["@id"] == "./")
+
+    # ORCID iD
+    def test_orcid_check_digits_and_forms(self):
+        n = self.bb.normal_orcid
+        self.assertEqual(n("0000-0002-1825-0097"), "0000-0002-1825-0097")
+        self.assertIsNone(n("0000-0002-1825-0098"))
+        self.assertEqual(n("0000-0002-1694-233x"), "0000-0002-1694-233X")
+        self.assertEqual(n("0000-0002-1694-233X"), "0000-0002-1694-233X")
+        self.assertEqual(n("https://orcid.org/0000-0002-1825-0097"), "0000-0002-1825-0097")
+        self.assertIsNone(n("0000000218250097"))
+        self.assertIsNone(n("https://example.org/0000-0002-1825-0097"))
+        self.assertIsNone(n(1825))
+
+    def test_plain_orcid_reaches_same_assistant_but_not_shareable(self):
+        self.edit_box(lambda d: d.update(author_orcid=f"https://orcid.org/{ORCID}"))
+        same = self.drop("same-assistant", "same")
+        self.assertEqual(json.loads((same / "box.json").read_text())["author_orcid"], ORCID)
+        self.assertIn(f"Author ORCID iD: https://orcid.org/{ORCID}",
+                      (same / "BOX.md").read_text())
+        self.assertEqual(self.root(same)["author"], {"@id": f"https://orcid.org/{ORCID}"})
+        person = next(e for e in self.graph(same) if e["@id"] == f"https://orcid.org/{ORCID}")
+        self.assertEqual(person["@type"], "Person")
+        self.assertEqual(person["name"], "A. Researcher")
+        share = self.drop("shareable", "share")
+        self.assertNotIn("author_orcid", json.loads((share / "box.json").read_text()))
+        for name in ("BOX.md", "ro-crate-metadata.json", "box.json"):
+            self.assertNotIn(ORCID, (share / name).read_text(), name)
+        self.assertIn("ORCID iD was left out", (share / "BOX.md").read_text())
+
+    def test_held_back_orcid_needs_out(self):
+        def change(d):
+            d["author_orcid"] = ORCID
+            for it in d["items"]:
+                it["sharing"] = "shareable"
+            d["state"] = d["state"][:1]
+            d["default_sharing"] = "shareable"
+            d.pop("public")
+            d.pop("private_terms")
+        self.edit_box(change)
+        r = run(self.box, "--for", "shareable")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("the author's ORCID iD", r.stderr)
+        self.assertIn("--out", r.stderr)
+        r = run(self.box, "--for", "shareable", "--preview")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("the author's ORCID iD (author_orcid), not cleared", r.stdout)
+        self.assertEqual(run(self.box, "--for", "same-assistant").returncode, 0)
+
+    def test_shareable_orcid_is_opt_in_and_survives_re_export(self):
+        self.edit_box(lambda d: d.update(author_orcid={"id": "0000-0002-1694-233x",
+                                                       "sharing": "shareable"}))
+        out = self.drop()
+        copy = json.loads((out / "box.json").read_text())
+        self.assertEqual(copy["author_orcid"], {"id": "0000-0002-1694-233X",
+                                                "sharing": "shareable"})
+        self.assertIn("0000-0002-1694-233X", (out / "BOX.md").read_text())
+        again = self.drop(name="again", box=out)
+        self.assertEqual(json.loads((again / "box.json").read_text())["author_orcid"],
+                         copy["author_orcid"])
+        self.assertEqual(run(again, "--check").returncode, 0)
+
+    def test_plain_orcid_is_kept_on_re_export_for_the_same_audience(self):
+        self.edit_box(lambda d: d.update(author_orcid=ORCID))
+        out = self.drop("same-assistant")
+        again = self.drop("same-assistant", "again", box=out)
+        self.assertEqual(json.loads((again / "box.json").read_text())["author_orcid"], ORCID)
+        share = self.drop("shareable", "share", box=out)
+        self.assertNotIn("author_orcid", json.loads((share / "box.json").read_text()))
+
+    def test_private_orcid_stays_out_of_same_assistant_drops(self):
+        self.edit_box(lambda d: d.update(author_orcid={"id": ORCID, "sharing": "private"}))
+        out = self.drop("same-assistant")
+        for name in ("BOX.md", "ro-crate-metadata.json", "box.json"):
+            self.assertNotIn(ORCID, (out / name).read_text(), name)
+        private = self.drop("private", "private")
+        self.assertIn(ORCID, (private / "BOX.md").read_text())
+
+    def test_bad_orcid_is_refused(self):
+        for bad in ("0000-0002-1825-0098", "0000000218250097", {"id": ORCID, "extra": 1},
+                    {"sharing": "shareable"}, 42):
+            self.edit_box(lambda d: d.update(author_orcid=bad))
+            r = run(self.box, "--for", "shareable", "--out", self.tmp / "never")
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn("author_orcid", r.stderr)
+            self.assertFalse((self.tmp / "never").exists())
+
+    def test_orcid_is_in_the_provenance_record(self):
+        self.edit_box(lambda d: d.update(author_orcid=ORCID))
+        out = self.drop("same-assistant")
+        r = run(out, "--id", "--provenance", self.tmp / "prov.json")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"ORCID {ORCID} (author_orcid)", r.stdout)
+        record = json.loads((self.tmp / "prov.json").read_text())
+        self.assertEqual(record["author_orcid"], ORCID)
+        plain = self.drop(name="plain", box=EXAMPLE)
+        run(plain, "--id", "--provenance", self.tmp / "plain.json")
+        self.assertNotIn("author_orcid", json.loads((self.tmp / "plain.json").read_text()))
+
+    # DOI
+    def test_doi_forms(self):
+        n = self.bb.normal_doi
+        for form in ("10.5555/12345678", "doi:10.5555/12345678", "DOI: 10.5555/12345678",
+                     "https://doi.org/10.5555/12345678", "http://dx.doi.org/10.5555/12345678",
+                     "https://DOI.org/10.5555/12345678"):
+            self.assertEqual(n(form), "10.5555/12345678", form)
+        self.assertEqual(n("https://doi.org/10.1000/ABC%2F%3Cx%3E"), "10.1000/abc/<x>")
+        self.assertEqual(n("doi:10.1000/a%2Fb"), "10.1000/a%2fb")
+        for bad in ("10.5555", "11.5555/x", "10.12/x", "https://example.org/10.5555/x",
+                    "10.5555/has space", "", None):
+            self.assertIsNone(n(bad), bad)
+
+    def test_doi_follows_its_item_and_is_cited(self):
+        def change(d):
+            d["items"][1]["doi"] = "https://doi.org/10.5555/RESULTS"      # shareable, live
+            d["items"][2]["doi"] = "doi:10.5555/code"                      # shareable, no live
+            d["items"][0]["doi"] = "10.5555/private-notes"                 # same-assistant
+        self.edit_box(change)
+        out = self.drop()
+        items = json.loads((out / "box.json").read_text())["items"]
+        self.assertEqual([it.get("doi") for it in items],
+                         ["10.5555/results", "10.5555/code"])
+        box_md = (out / "BOX.md").read_text()
+        self.assertIn("DOI 10.5555/results", box_md)
+        self.assertNotIn("private-notes", (out / "ro-crate-metadata.json").read_text())
+        self.assertNotIn("private-notes", box_md)
+        root = self.root(out)
+        self.assertEqual(root["citation"], [{"@id": "https://example.com/results"},
+                                            {"@id": "https://doi.org/10.5555/code"}])
+        graph = self.graph(out)
+        live = next(e for e in graph if e["@id"] == "https://example.com/results")
+        self.assertEqual(live["identifier"], "https://doi.org/10.5555/results")
+        code = next(e for e in graph if e["@id"] == "https://doi.org/10.5555/code")
+        self.assertEqual(code["@type"], "CreativeWork")
+        self.assertEqual(code["name"], "Simulation")
+        self.assertEqual(run(out, "--check").returncode, 0)
+
+    def test_bad_doi_and_a_second_doi_are_refused(self):
+        for bad, live in (("10.5555", None), ("https://example.org/10.5555/x", None),
+                          ("10.5555/one", "https://doi.org/10.5555/two")):
+            def change(d):
+                d["items"][1]["doi"] = bad
+                if live:
+                    d["items"][1]["live"] = live
+            self.edit_box(change)
+            r = run(self.box, "--for", "shareable", "--out", self.tmp / "never")
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn("doi", r.stderr)
+            self.assertFalse((self.tmp / "never").exists())
+
+    def test_doi_matching_its_live_link_is_accepted(self):
+        def change(d):
+            d["items"][1]["live"] = "https://doi.org/10.5555/12345678"
+            d["items"][1]["doi"] = "10.5555/12345678"
+        self.edit_box(change)
+        out = self.drop()
+        self.assertEqual(self.root(out)["citation"],
+                         [{"@id": "https://doi.org/10.5555/12345678"}])
+
+    def test_check_reports_a_hand_edited_identifier(self):
+        self.edit_box(lambda d: (d.update(author_orcid=ORCID),
+                                 d["items"][1].update(doi="10.5555/x")))
+        out = self.drop("same-assistant")
+        self.assertEqual(run(out, "--check").returncode, 0)
+        for change in (lambda d: d.update(author_orcid="0000-0002-1825-0098"),
+                       lambda d: d["items"][0].update(doi="not-a-doi")):
+            work = self.tmp / "work"
+            if work.exists():
+                shutil.rmtree(work)
+            shutil.copytree(out, work)
+            self.edit_box(change, box=work)
+            # Rewrite the tag manifest, so only the identifier check can catch it.
+            (work / "tagmanifest-sha256.txt").write_text("".join(
+                f"{hashlib.sha256((work / n).read_bytes()).hexdigest()}  {n}\n"
+                for n in ("BOX.md", "box.json", "ro-crate-metadata.json",
+                          "manifest-sha256.txt")))
+            r = run(work, "--check")
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("Malformed identifier in box.json", r.stdout)
+
+    def test_lookup_claims_include_author_orcid_and_item_doi(self):
+        box = {"author_ids": [{"scheme": "orcid", "id": ORCID}],
+               "author_orcid": f"https://orcid.org/{ORCID}",
+               "items": [{"item": "A", "live": "https://doi.org/10.5555/A", "doi": "10.5555/a"},
+                         {"item": "B", "doi": "doi:10.5555/b"}]}
+        self.assertEqual(self.bb.box_claims(box),
+                         [("orcid", ORCID, None), ("doi", "10.5555/A", "A"),
+                          ("doi", "10.5555/b", "B")])
+        box["author_ids"] = []
+        self.assertEqual(self.bb.box_claims(box)[0], ("orcid", ORCID, None))
+
+    def test_receipt_about_a_held_back_orcid_stays_with_it(self):
+        self.edit_box(lambda d: d.update(author_orcid=ORCID))
+        receipts = self.box / "receipts"
+        receipts.mkdir()
+        body = ORCID_PERSON
+        (receipts / "orcid.json").write_bytes(body)
+        index = {"type": "research-box-receipts/v1", "claim": "Registries do not sign.",
+                 "receipts": [{"claim": {"scheme": "orcid", "id": ORCID},
+                               "registry": "orcid-public-api",
+                               "url": f"https://pub.orcid.org/v3.0/{ORCID}/person",
+                               "asked": "2026-11-28T00:00:00+00:00", "status": 200,
+                               "response": "receipts/orcid.json",
+                               "response_sha256": hashlib.sha256(body).hexdigest(),
+                               "answer": {"found": True, "name": "Josiah Carberry"}}]}
+        (receipts / "receipts.json").write_text(json.dumps(index))
+        same = self.drop("same-assistant", "same")
+        self.assertTrue((same / "receipts" / "orcid.json").is_file())
+        share = self.drop("shareable", "share")
+        self.assertFalse((share / "receipts" / "orcid.json").exists())
+        self.assertNotIn(ORCID, (share / "receipts" / "receipts.json").read_text())
+        self.assertNotIn(ORCID, (share / "manifest-sha256.txt").read_text())
+
+    def test_boxes_without_the_fields_drop_byte_for_byte_as_before(self):
+        out = self.drop()
+        self.assertNotIn("citation", self.root(out))
+        self.assertNotIn("author_orcid", (out / "box.json").read_text())
+        self.assertIn({"@id": "#author"}, [self.root(out)["author"]])
 
 
 if __name__ == "__main__":

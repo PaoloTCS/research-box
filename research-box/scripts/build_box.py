@@ -37,8 +37,8 @@ Reads <box-folder>/box.json (format in references/box-format.md). Standard libra
 --check   Compare the folder's files with manifest-sha256.txt and tagmanifest-sha256.txt and
           report files that changed, went missing or are not in the manifests. Writes nothing.
           Exit status: 0 = everything matches, 1 = a file changed, went missing or is not
-          listed, 2 = the check is incomplete (no manifest or no tag manifest). Run it after
-          every copy and before a refresh.
+          listed or an identifier in box.json is malformed, 2 = the check is incomplete (no
+          manifest or no tag manifest). Run it after every copy and before a refresh.
 --strict  Refuse a shareable drop, writing nothing, when a watch word (private_terms) appears
           in any generated file, text snapshot or Office/OpenDocument file, or when a file
           cannot be scanned (PDFs, images, embedded files) unless --allow-unscanned is given
@@ -77,8 +77,9 @@ Reads <box-folder>/box.json (format in references/box-format.md). Standard libra
           manifests, an allowed key signed the record, and every identifier in it is the
           drop's own. Exit status: 0 verified, 1 does not match, 2 could not check.
 
---lookup  Ask the registries about every ORCID iD and ISNI in author_ids and every DOI an
-          item links to (live: https://doi.org/10... or doi:10...), and save each answer as
+--lookup  Ask the registries about every ORCID iD and ISNI in author_ids (and author_orcid)
+          and every DOI an item gives (doi) or links to (live: https://doi.org/10... or
+          doi:10...), and save each answer as
           a receipt under receipts/: the claim, the registry and address asked, the time, the
           HTTP status, the response saved byte for byte, its SHA-256 and the answer read
           from it. DOIs are asked of doi.org twice (the handle record and the citation
@@ -133,15 +134,15 @@ from pathlib import Path, PurePath
 LEVELS = {"private": 0, "same-assistant": 1, "shareable": 2}
 LABELS = {"private": "Private", "same-assistant": "Same assistant", "shareable": "Shareable"}
 BOX_KEYS = ["box", "title", "description", "created", "dropped", "author", "author_ids",
-            "license", "previous", "default_sharing", "topics", "state", "public", "level_labels", "private_terms",
+            "author_orcid", "license", "previous", "default_sharing", "topics", "state", "public", "level_labels", "private_terms",
             "prepared_for", "reproduce", "items"]
-ITEM_KEYS = ["item", "kind", "live", "live_sha256", "live_pinned", "revision", "snapshot",
-             "sharing", "notes"]
+ITEM_KEYS = ["item", "kind", "live", "live_sha256", "live_pinned", "revision", "doi",
+             "snapshot", "sharing", "notes"]
 REPRO_KEYS = ["name", "command", "inputs", "requires", "timeout_seconds", "sharing", "expect"]
 GENERATED = {"BOX.md", "box.json", "ro-crate-metadata.json", "manifest-sha256.txt",
              "tagmanifest-sha256.txt"}
 TAGGED = ["BOX.md", "box.json", "ro-crate-metadata.json", "manifest-sha256.txt"]
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 # What a reproduction report (and so a signature on it) can claim, and what it cannot.
 REPORT_CLAIM = ("Running these exact files with the declared command produced the declared "
                 "outputs within the declared tolerances. This does not show that the outputs "
@@ -297,7 +298,16 @@ def check(folder):
                         ("Not in the manifest", extra)):
         if rows:
             print(f"{label}: " + ", ".join(rows))
-    if changed or missing or extra or outside:
+    malformed = []
+    try:
+        box = json.loads((folder / "box.json").read_text(encoding="utf-8"))
+        if isinstance(box, dict):
+            malformed = identifier_problems(box)
+    except (OSError, UnicodeDecodeError, ValueError):
+        pass
+    for why in malformed:
+        print(f"Malformed identifier in box.json: {why}")
+    if changed or missing or extra or outside or malformed:
         return 1
     if incomplete:
         print("The snapshot files match, but the check is incomplete.")
@@ -1250,6 +1260,90 @@ def author_id_uri(entry):
     return f"{entry['scheme']}:{entry['id']}"
 
 
+# A box may also give its author's ORCID iD on its own (author_orcid) and a DOI for any item
+# (doi). Both are checked offline (the ORCID check digit, the DOI's shape) and written in a
+# normal form. Unlike author_ids, author_orcid follows a sharing level: as a plain string it
+# goes no wider than same-assistant drops, and a shareable drop carries it only when the box
+# says so ({"id": ..., "sharing": "shareable"}). An item's DOI goes wherever its item goes.
+
+ORCID_SHARING = "same-assistant"
+ORCID_URL = re.compile(r"https?://(?:www\.)?orcid\.org/", re.I)
+DOI_PREFIX = re.compile(r"(doi:\s*|https?://(?:dx\.)?doi\.org/)", re.I)
+
+
+def normal_orcid(value):
+    """The bare ORCID iD (0000-0002-1825-0097, upper-case X) from the bare or
+    https://orcid.org/ form, or None if it is malformed or its check digit is wrong."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    m = ORCID_URL.match(v)
+    if m:
+        v = v[m.end():]
+    v = v.upper()
+    if re.fullmatch(r"\d{4}-\d{4}-\d{4}-\d{3}[\dX]", v) and iso7064_ok(v.replace("-", "")):
+        return v
+    return None
+
+
+def normal_doi(value):
+    """The bare lower-case DOI (10.xxxx/...) from a bare, doi:, https://doi.org/ or
+    https://dx.doi.org/ form (the URL forms percent-decoded), or None if malformed."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    m = DOI_PREFIX.match(v)
+    if m:
+        v = v[m.end():]
+        if not m.group(1).lower().startswith("doi:"):
+            v = urllib.parse.unquote(v)
+    v = v.lower()
+    if re.fullmatch(r"10\.\d{4,9}/[^\s\x00-\x1f\x7f]+", v):
+        return v
+    return None
+
+
+def orcid_entry(raw):
+    """(bare iD, sharing value as written or None, why) for an author_orcid value."""
+    if isinstance(raw, dict):
+        unknown = [k for k in raw if k not in ("id", "sharing")]
+        if unknown:
+            return None, None, f"unknown field(s) {', '.join(unknown)}"
+        if "sharing" in raw and not isinstance(raw["sharing"], str):
+            return None, None, "sharing must be a sharing level"
+        value, sharing = raw.get("id"), raw.get("sharing")
+    else:
+        value, sharing = raw, None
+    iD = normal_orcid(value)
+    if iD is None:
+        return None, None, (f"{value!r} is not an ORCID iD (16 digits in groups of four, the "
+                            "last a check digit or X; bare or as https://orcid.org/...)")
+    return iD, sharing, None
+
+
+def identifier_problems(box):
+    """Malformed identifiers in a box.json: author_ids, author_orcid and item DOIs."""
+    problems = []
+    ids = box.get("author_ids", [])
+    if not isinstance(ids, list):
+        problems.append("author_ids must be a list")
+    else:
+        for i, entry in enumerate(ids, 1):
+            why = author_id_problem(entry)
+            if why:
+                problems.append(f"author_ids[{i}]: {why}")
+    if box.get("author_orcid") is not None:
+        why = orcid_entry(box["author_orcid"])[2]
+        if why:
+            problems.append(f"author_orcid: {why}")
+    for it in box.get("items", []) or []:
+        if isinstance(it, dict) and it.get("doi") is not None and normal_doi(it["doi"]) is None:
+            problems.append(f"item {it.get('item')!r}: doi {it['doi']!r} is not a DOI "
+                            "(10.<registrant>/<suffix>, bare or as doi:, https://doi.org/ or "
+                            "https://dx.doi.org/)")
+    return problems
+
+
 def content_id(folder):
     """The SHA-256 of the manifest's lines sorted by path, as "sha256:<hex>"."""
     rows = []
@@ -1267,11 +1361,15 @@ def drop_identity(folder):
     box = json.loads((folder / "box.json").read_text(encoding="utf-8"))
     files = sum(1 for line in (folder / "manifest-sha256.txt").read_text(
         encoding="utf-8").splitlines() if line.strip())
-    return {"box": box.get("box", ""), "dropped": box.get("dropped", ""),
-            "content_id": content_id(folder),
-            "drop_id": "sha256:" + sha256(folder / "tagmanifest-sha256.txt"),
-            "files": files, "author": box.get("author"),
-            "author_ids": box.get("author_ids", []), "previous": box.get("previous")}
+    ident = {"box": box.get("box", ""), "dropped": box.get("dropped", ""),
+             "content_id": content_id(folder),
+             "drop_id": "sha256:" + sha256(folder / "tagmanifest-sha256.txt"),
+             "files": files, "author": box.get("author"),
+             "author_ids": box.get("author_ids", []), "previous": box.get("previous")}
+    if box.get("author_orcid") is not None:
+        # Only when the drop carries one, so records of other drops stay as they were.
+        ident["author_orcid"] = orcid_entry(box["author_orcid"])[0]
+    return ident
 
 
 def show_id(folder, args):
@@ -1295,6 +1393,8 @@ def show_id(folder, args):
     try:
         ident = drop_identity(folder)
         read_identity(json.loads((folder / "box.json").read_text(encoding="utf-8")), stop)
+        if "author_orcid" in ident and ident["author_orcid"] is None:
+            stop("author_orcid is not a valid ORCID iD")
     except (OSError, ValueError, SystemExit) as err:
         print(f"Could not read the drop's box.json ({err}). Nothing was written.")
         return 2
@@ -1305,6 +1405,8 @@ def show_id(folder, args):
         print(f"Author:     {ident['author']}")
     for entry in ident["author_ids"]:
         print(f"            {author_id_text(entry)}")
+    if ident.get("author_orcid"):
+        print(f"            ORCID {ident['author_orcid']} (author_orcid)")
     if ident["previous"]:
         print(f"Replaces:   {ident['previous']}")
     if args.provenance is not None:
@@ -1371,16 +1473,20 @@ def verify_provenance(folder, args):
         print(f"Could not read the drop's box.json ({err}). Nothing was verified.")
         return 2
     wrong = [k for k in ("box", "dropped", "content_id", "drop_id", "files", "author",
-                         "author_ids", "previous") if record.get(k) != ident[k]]
+                         "author_ids", "author_orcid", "previous")
+             if record.get(k) != ident.get(k)]
     for k in wrong:
-        print(f"  {k}: the record says {record.get(k)!r}; this drop says {ident[k]!r}")
+        print(f"  {k}: the record says {record.get(k)!r}; this drop says {ident.get(k)!r}")
     if wrong:
         print("Result: not verified. The signed record describes another drop or another "
               "author.")
         return 1
     who_wrote = ident["author"] or "an unnamed author"
-    if ident["author_ids"]:
-        who_wrote += " (" + ", ".join(author_id_text(e) for e in ident["author_ids"]) + ")"
+    shown_ids = [author_id_text(e) for e in ident["author_ids"]]
+    if ident.get("author_orcid") and f"ORCID {ident['author_orcid']}" not in shown_ids:
+        shown_ids.append(f"ORCID {ident['author_orcid']}")
+    if shown_ids:
+        who_wrote += " (" + ", ".join(shown_ids) + ")"
     print(f"Result: verified. {who} signed that content {ident['content_id']}, drop "
           f"{ident['drop_id']}, is the box {ident['box']} by {who_wrote}"
           + (f", replacing {ident['previous']}" if ident["previous"] else "") + ". A "
@@ -1569,10 +1675,16 @@ def box_claims(box):
             scheme = entry["scheme"].lower()
             value = entry["id"].replace(" ", "") if scheme == "isni" else entry["id"]
             claims.append((scheme, value, None))
+    if box.get("author_orcid") is not None:
+        iD = orcid_entry(box["author_orcid"])[0]
+        if iD and claim_key("orcid", iD) not in {claim_key(s, v) for s, v, _ in claims}:
+            claims.append(("orcid", iD, None))
     for it in box.get("items", []) or []:
-        doi = doi_of(it.get("live"))
-        if doi:
-            claims.append(("doi", doi, it.get("item")))
+        seen = set()
+        for doi in (doi_of(it.get("live")), normal_doi(it.get("doi"))):
+            if doi and claim_key("doi", doi) not in seen:
+                seen.add(claim_key("doi", doi))
+                claims.append(("doi", doi, it.get("item")))
     return claims
 
 
@@ -2050,7 +2162,8 @@ def size_text(n):
 
 def preview(box, audience, out, held, kept, left_out, sums, details, use_box, state,
             state_held, repro, repro_held, extra_fields, receipts_kept, receipts_held,
-            receipts_stale, texts, hits, unscanned, scanned, strict, allow_unscanned):
+            receipts_stale, texts, hits, unscanned, scanned, strict, allow_unscanned,
+            orcid_kept=None, orcid_held=False, receipts_orcid_held=0):
     """Print what a drop would give its readers. Exit status: 0 the drop can be written
     (with --out when it holds something back), 1 --strict would refuse it."""
     who = f"{LABELS[audience]} readers"
@@ -2086,6 +2199,8 @@ def preview(box, audience, out, held, kept, left_out, sums, details, use_box, st
     if box.get("author"):
         print(f"  - the author's name ({box['author']})"
               + (" and identifiers" if box.get("author_ids") else ""))
+    if orcid_kept:
+        print(f"  - the author's ORCID iD (https://orcid.org/{orcid_kept})")
     if repro:
         print(f"  - the reproduce command: {command_text(repro['command'])}")
     if receipts_kept:
@@ -2104,6 +2219,10 @@ def preview(box, audience, out, held, kept, left_out, sums, details, use_box, st
                     + (" (the public wording is used instead)" if box.get("public") else ""))
     if repro_held:
         left.append("the reproduce command")
+    if orcid_held:
+        left.append("the author's ORCID iD (author_orcid), not cleared for " + who
+                    + (f", with {receipts_orcid_held} registry receipt(s) about it"
+                       if receipts_orcid_held else ""))
     if receipts_held:
         left.append(f"{receipts_held} registry receipt(s) about items left out")
     if receipts_stale and (out or held):
@@ -2117,7 +2236,8 @@ def preview(box, audience, out, held, kept, left_out, sums, details, use_box, st
     print("Left out:" if left else "Left out: nothing.")
     for line in left:
         print(f"  - {line}")
-    said = [ln for ln in texts["BOX.md"].splitlines() if "were left out" in ln]
+    said = [ln for ln in texts["BOX.md"].splitlines()
+            if "were left out" in ln or "was left out" in ln]
     if left:
         print(("BOX.md says: \"" + " ".join(said) + "\" " if said else
                "BOX.md says nothing about what was left out. ")
@@ -2403,6 +2523,26 @@ def main(argv):
     items = [dict(it, sharing=level_of(it.get("sharing"), box, f"item {it['item']!r}"))
              for it in box["items"]]
     author_ids, previous = read_identity(box, refuse)
+    orcid, orcid_level, orcid_dict = None, None, False
+    if box.get("author_orcid") is not None:
+        orcid, orcid_sharing, why = orcid_entry(box["author_orcid"])
+        if why:
+            refuse(f"author_orcid: {why}.")
+        orcid_dict = isinstance(box["author_orcid"], dict)
+        orcid_level = level_of(orcid_sharing, box, "author_orcid") if orcid_sharing \
+            else ORCID_SHARING
+    for it in items:
+        if it.get("doi") is not None:
+            doi = normal_doi(it["doi"])
+            if doi is None:
+                refuse(f"item {it['item']!r}: doi {it['doi']!r} is not a DOI (10.<registrant>/"
+                       "<suffix>, bare or as doi:, https://doi.org/ or https://dx.doi.org/).")
+            linked = normal_doi(it["live"]) if isinstance(it.get("live"), str) \
+                and DOI_PREFIX.match(it["live"].strip()) else None
+            if linked and linked != doi:
+                refuse(f"item {it['item']!r}: doi {doi} is not the DOI its live link names "
+                       f"({linked}). Give one DOI.")
+            it["doi"] = doi
     for it in items:
         if "live_sha256" in it and not (web_link(it.get("live")) and isinstance(
                 it["live_sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", it["live_sha256"])):
@@ -2440,6 +2580,8 @@ def main(argv):
 
     kept = [it for it in items if cleared(it["sharing"])]
     left_out = [it for it in items if not cleared(it["sharing"])]
+    orcid_kept = orcid is not None and cleared(orcid_level)
+    orcid_held = orcid is not None and not orcid_kept
 
     # Reproduce block: checked in every drop. It has its own sharing level (the box's
     # default unless given). When it is cleared, every box file it runs or reads must be a
@@ -2468,7 +2610,7 @@ def main(argv):
     if why:
         refuse(why + ".")
     receipts = receipts or []
-    receipts_kept, receipts_held, receipts_stale = [], 0, 0
+    receipts_kept, receipts_held, receipts_stale, receipts_orcid_held = [], 0, 0, 0
     if receipts:
         clash = [rel for it in items for rel in it.get("snapshot", [])
                  if PurePath(rel).parts[:1] == (RECEIPTS_DIR,)]
@@ -2482,10 +2624,18 @@ def main(argv):
                        f"{r['registry']}): {problem[1]}. Run --lookup again.")
         kept_names = {it["item"] for it in kept}
         making = {(claim_key(sc, v), it) for sc, v, it in box_claims(box)}
+        # A receipt about author_orcid alone stays with author_orcid.
+        orcid_only = set()
+        if orcid_held:
+            listed = {claim_key(sc, v) for sc, v, _ in box_claims(dict(box, author_orcid=None))}
+            if claim_key("orcid", orcid) not in listed:
+                orcid_only.add(claim_key("orcid", orcid))
         for r in receipts:
             key = (claim_key(r["claim"]["scheme"], r["claim"]["id"]), r.get("item"))
             if key not in making:
                 receipts_stale += 1
+            elif r.get("item") is None and key[0] in orcid_only:
+                receipts_orcid_held += 1
             elif r.get("item") is None or r["item"] in kept_names:
                 receipts_kept.append(r)
             else:
@@ -2509,6 +2659,10 @@ def main(argv):
         held.append("the box's own details")
     if extra_fields and audience != "private":
         held.append(f"field(s) outside the format ({', '.join(extra_fields)})")
+    if orcid_held:
+        held.append("the author's ORCID iD"
+                    + (f" and {receipts_orcid_held} registry receipt(s) about it"
+                       if receipts_orcid_held else ""))
     if receipts_held:
         held.append(f"{receipts_held} registry receipt(s)")
     if held and not out and not args.preview:
@@ -2566,6 +2720,8 @@ def main(argv):
         lines.append(f"- Author: {box['author']}")
     if author_ids:
         lines.append("- Author identifiers: " + "; ".join(author_id_text(e) for e in author_ids))
+    if orcid_kept:
+        lines.append(f"- Author ORCID iD: https://orcid.org/{orcid}")
     if previous:
         lines.append(f"- Replaces the drop: {previous}")
     if topics:
@@ -2582,6 +2738,8 @@ def main(argv):
         if it.get("live_sha256"):
             when = f" {it['live_pinned']}" if it.get("live_pinned") else ""
             note = f"Live page pinned{when}: SHA-256 {it['live_sha256']}. {note}".strip()
+        if it.get("doi"):
+            note = f"DOI {it['doi']}. {note}".strip()
         lines.append(f"| {it['item']} | {it.get('kind', '')} | {live} | {snap} | "
                      f"{LABELS[it['sharing']]} | {note} |")
     if state:
@@ -2598,7 +2756,10 @@ def main(argv):
                       "copy, and reports whether the result reproduced. Running it executes "
                       "this box's code with your permissions; it is not a sandbox."]
     if receipts_kept:
-        shown = receipt_findings(dict(box, items=kept), receipts_kept)
+        drop_box = dict(box, items=kept)
+        if not orcid_kept:
+            drop_box.pop("author_orcid", None)
+        shown = receipt_findings(drop_box, receipts_kept)
         lines += ["", "## Registry receipts", "",
                   "What each registry answered when it was asked, saved under receipts/. "
                   "`build_box.py <this folder> --check-receipts` replays them offline; "
@@ -2613,6 +2774,11 @@ def main(argv):
     if left_out:
         lines += ["", f"{len(left_out)} item(s) were left out because they are not cleared for "
                       f"{LABELS[audience]} readers."]
+    if orcid_held:
+        lines += ["", f"The author's ORCID iD was left out because it is not cleared for "
+                      f"{LABELS[audience]} readers"
+                      + (", with the registry receipts about it." if receipts_orcid_held
+                         else ".")]
     if receipts_held:
         lines.append(f"{receipts_held} registry receipt(s) about those items were left out "
                      "with them.")
@@ -2627,6 +2793,7 @@ def main(argv):
         parts.append({"@id": rel})
         entities.append({"@id": rel, "@type": "File", "name": rel, "contentSize": str(size),
                          "sha256": h})
+    citations = []
     for it in kept:
         if it.get("live"):
             parts.append({"@id": it["live"]})
@@ -2639,7 +2806,16 @@ def main(argv):
                 ent["sha256"] = it["live_sha256"]
                 if it.get("live_pinned"):
                     ent["sdDatePublished"] = it["live_pinned"]
+            if it.get("doi"):
+                ent["identifier"] = f"https://doi.org/{it['doi']}"
+                citations.append({"@id": it["live"]})
             entities.append(ent)
+        elif it.get("doi"):
+            doi_url = f"https://doi.org/{it['doi']}"
+            if all(e.get("@id") != doi_url for e in entities):
+                entities.append({"@id": doi_url, "@type": "CreativeWork", "name": it["item"],
+                                 "identifier": doi_url})
+            citations.append({"@id": doi_url})
     root = {"@id": "./", "@type": "Dataset", "name": title, "identifier": box["box"],
             "description": description or f"Research box {box['box']}",
             "datePublished": box.get("dropped", box.get("created", "")), "hasPart": parts}
@@ -2647,9 +2823,12 @@ def main(argv):
         root["keywords"] = topics
     if box.get("license"):
         root["license"] = box["license"]
-    if box.get("author") or author_ids:
-        root["author"] = {"@id": "#author"}
-        person = {"@id": "#author", "@type": "Person",
+    if citations:
+        root["citation"] = [c for i, c in enumerate(citations) if c not in citations[:i]]
+    if box.get("author") or author_ids or orcid_kept:
+        person_id = f"https://orcid.org/{orcid}" if orcid_kept else "#author"
+        root["author"] = {"@id": person_id}
+        person = {"@id": person_id, "@type": "Person",
                   "name": box.get("author") or "Unnamed author"}
         if author_ids:
             person["identifier"] = [author_id_uri(e) for e in author_ids]
@@ -2716,6 +2895,9 @@ def main(argv):
         for k in ("box", "created", "dropped", "author", "author_ids", "license", "previous"):
             if k in box:
                 copy[k] = box[k]
+            if k == "author_ids" and orcid_kept:
+                copy["author_orcid"] = {"id": orcid, "sharing": orcid_level} if orcid_dict \
+                    else orcid
         copy["default_sharing"] = box_level if use_box else audience
         for k, v in (("title", title), ("description", description), ("topics", topics),
                      ("state", state_entries)):
@@ -2775,7 +2957,8 @@ def main(argv):
             receipts_held=receipts_held, receipts_stale=receipts_stale, texts=texts,
             hits={n: describe(n, f) for n, f in hits.items()}, unscanned=unscanned,
             scanned=bool(terms) and audience == "shareable", strict=args.strict,
-            allow_unscanned=args.allow_unscanned))
+            allow_unscanned=args.allow_unscanned, orcid_kept=orcid if orcid_kept else None,
+            orcid_held=orcid_held, receipts_orcid_held=receipts_orcid_held))
     if hits and args.strict:
         refuse("Strict mode: watch words found in "
                + "; ".join(describe(n, f) for n, f in hits.items()) + ".")
@@ -2814,6 +2997,10 @@ def main(argv):
     if not use_box:
         print(f"Held back for {audience} readers: the box's own title, description, topics and "
               f"state" + (" (the public block was used instead)" if box.get("public") else ""))
+    if orcid_held:
+        print(f"Held back for {audience} readers: the author's ORCID iD (author_orcid)"
+              + (f" and {receipts_orcid_held} registry receipt(s) about it"
+                 if receipts_orcid_held else ""))
     if receipts_held:
         print(f"Held back for {audience} readers: {receipts_held} registry receipt(s) about "
               "items left out")

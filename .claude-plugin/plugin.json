@@ -1,7 +1,7 @@
 {
   "name": "research-box",
   "displayName": "Research Box",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Bundle related research work into named boxes with sharing levels that only narrow, RO-Crate metadata and checksummed snapshot drops.",
   "author": {
     "name": "Paolo Pignatelli",

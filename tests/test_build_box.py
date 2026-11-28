@@ -2362,5 +2362,254 @@ class RepositoryTests(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
+class OrcidDoiTests(unittest.TestCase):
+    """author_orcid (with its sharing rule) and item DOIs: checked offline, normalized,
+    written into BOX.md and RO-Crate, caught by --check when hand-edited."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.box = self.tmp / "box"
+        shutil.copytree(EXAMPLE, self.box)
+        self.bb = load_script()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def edit_box(self, change, box=None):
+        path = (box or self.box) / "box.json"
+        data = json.loads(path.read_text())
+        change(data)
+        path.write_text(json.dumps(data))
+
+    def drop(self, audience="shareable", name="drop", box=None):
+        out = self.tmp / name
+        r = run(box or self.box, "--for", audience, "--out", out)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return out
+
+    def graph(self, out):
+        return json.loads((out / "ro-crate-metadata.json").read_text())["@graph"]
+
+    def root(self, out):
+        return next(e for e in self.graph(out) if e["@id"] == "./")
+
+    # ORCID iD
+    def test_orcid_check_digits_and_forms(self):
+        n = self.bb.normal_orcid
+        self.assertEqual(n("0000-0002-1825-0097"), "0000-0002-1825-0097")
+        self.assertIsNone(n("0000-0002-1825-0098"))
+        self.assertEqual(n("0000-0002-1694-233x"), "0000-0002-1694-233X")
+        self.assertEqual(n("0000-0002-1694-233X"), "0000-0002-1694-233X")
+        self.assertEqual(n("https://orcid.org/0000-0002-1825-0097"), "0000-0002-1825-0097")
+        self.assertIsNone(n("0000000218250097"))
+        self.assertIsNone(n("https://example.org/0000-0002-1825-0097"))
+        self.assertIsNone(n(1825))
+
+    def test_plain_orcid_reaches_same_assistant_but_not_shareable(self):
+        self.edit_box(lambda d: d.update(author_orcid=f"https://orcid.org/{ORCID}"))
+        same = self.drop("same-assistant", "same")
+        self.assertEqual(json.loads((same / "box.json").read_text())["author_orcid"], ORCID)
+        self.assertIn(f"Author ORCID iD: https://orcid.org/{ORCID}",
+                      (same / "BOX.md").read_text())
+        self.assertEqual(self.root(same)["author"], {"@id": f"https://orcid.org/{ORCID}"})
+        person = next(e for e in self.graph(same) if e["@id"] == f"https://orcid.org/{ORCID}")
+        self.assertEqual(person["@type"], "Person")
+        self.assertEqual(person["name"], "A. Researcher")
+        share = self.drop("shareable", "share")
+        self.assertNotIn("author_orcid", json.loads((share / "box.json").read_text()))
+        for name in ("BOX.md", "ro-crate-metadata.json", "box.json"):
+            self.assertNotIn(ORCID, (share / name).read_text(), name)
+        self.assertIn("ORCID iD was left out", (share / "BOX.md").read_text())
+
+    def test_held_back_orcid_needs_out(self):
+        def change(d):
+            d["author_orcid"] = ORCID
+            for it in d["items"]:
+                it["sharing"] = "shareable"
+            d["state"] = d["state"][:1]
+            d["default_sharing"] = "shareable"
+            d.pop("public")
+            d.pop("private_terms")
+        self.edit_box(change)
+        r = run(self.box, "--for", "shareable")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("the author's ORCID iD", r.stderr)
+        self.assertIn("--out", r.stderr)
+        r = run(self.box, "--for", "shareable", "--preview")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("the author's ORCID iD (author_orcid), not cleared", r.stdout)
+        self.assertEqual(run(self.box, "--for", "same-assistant").returncode, 0)
+
+    def test_shareable_orcid_is_opt_in_and_survives_re_export(self):
+        self.edit_box(lambda d: d.update(author_orcid={"id": "0000-0002-1694-233x",
+                                                       "sharing": "shareable"}))
+        out = self.drop()
+        copy = json.loads((out / "box.json").read_text())
+        self.assertEqual(copy["author_orcid"], {"id": "0000-0002-1694-233X",
+                                                "sharing": "shareable"})
+        self.assertIn("0000-0002-1694-233X", (out / "BOX.md").read_text())
+        again = self.drop(name="again", box=out)
+        self.assertEqual(json.loads((again / "box.json").read_text())["author_orcid"],
+                         copy["author_orcid"])
+        self.assertEqual(run(again, "--check").returncode, 0)
+
+    def test_plain_orcid_is_kept_on_re_export_for_the_same_audience(self):
+        self.edit_box(lambda d: d.update(author_orcid=ORCID))
+        out = self.drop("same-assistant")
+        again = self.drop("same-assistant", "again", box=out)
+        self.assertEqual(json.loads((again / "box.json").read_text())["author_orcid"], ORCID)
+        share = self.drop("shareable", "share", box=out)
+        self.assertNotIn("author_orcid", json.loads((share / "box.json").read_text()))
+
+    def test_private_orcid_stays_out_of_same_assistant_drops(self):
+        self.edit_box(lambda d: d.update(author_orcid={"id": ORCID, "sharing": "private"}))
+        out = self.drop("same-assistant")
+        for name in ("BOX.md", "ro-crate-metadata.json", "box.json"):
+            self.assertNotIn(ORCID, (out / name).read_text(), name)
+        private = self.drop("private", "private")
+        self.assertIn(ORCID, (private / "BOX.md").read_text())
+
+    def test_bad_orcid_is_refused(self):
+        for bad in ("0000-0002-1825-0098", "0000000218250097", {"id": ORCID, "extra": 1},
+                    {"sharing": "shareable"}, 42):
+            self.edit_box(lambda d: d.update(author_orcid=bad))
+            r = run(self.box, "--for", "shareable", "--out", self.tmp / "never")
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn("author_orcid", r.stderr)
+            self.assertFalse((self.tmp / "never").exists())
+
+    def test_orcid_is_in_the_provenance_record(self):
+        self.edit_box(lambda d: d.update(author_orcid=ORCID))
+        out = self.drop("same-assistant")
+        r = run(out, "--id", "--provenance", self.tmp / "prov.json")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"ORCID {ORCID} (author_orcid)", r.stdout)
+        record = json.loads((self.tmp / "prov.json").read_text())
+        self.assertEqual(record["author_orcid"], ORCID)
+        plain = self.drop(name="plain", box=EXAMPLE)
+        run(plain, "--id", "--provenance", self.tmp / "plain.json")
+        self.assertNotIn("author_orcid", json.loads((self.tmp / "plain.json").read_text()))
+
+    # DOI
+    def test_doi_forms(self):
+        n = self.bb.normal_doi
+        for form in ("10.5555/12345678", "doi:10.5555/12345678", "DOI: 10.5555/12345678",
+                     "https://doi.org/10.5555/12345678", "http://dx.doi.org/10.5555/12345678",
+                     "https://DOI.org/10.5555/12345678"):
+            self.assertEqual(n(form), "10.5555/12345678", form)
+        self.assertEqual(n("https://doi.org/10.1000/ABC%2F%3Cx%3E"), "10.1000/abc/<x>")
+        self.assertEqual(n("doi:10.1000/a%2Fb"), "10.1000/a%2fb")
+        for bad in ("10.5555", "11.5555/x", "10.12/x", "https://example.org/10.5555/x",
+                    "10.5555/has space", "", None):
+            self.assertIsNone(n(bad), bad)
+
+    def test_doi_follows_its_item_and_is_cited(self):
+        def change(d):
+            d["items"][1]["doi"] = "https://doi.org/10.5555/RESULTS"      # shareable, live
+            d["items"][2]["doi"] = "doi:10.5555/code"                      # shareable, no live
+            d["items"][0]["doi"] = "10.5555/private-notes"                 # same-assistant
+        self.edit_box(change)
+        out = self.drop()
+        items = json.loads((out / "box.json").read_text())["items"]
+        self.assertEqual([it.get("doi") for it in items],
+                         ["10.5555/results", "10.5555/code"])
+        box_md = (out / "BOX.md").read_text()
+        self.assertIn("DOI 10.5555/results", box_md)
+        self.assertNotIn("private-notes", (out / "ro-crate-metadata.json").read_text())
+        self.assertNotIn("private-notes", box_md)
+        root = self.root(out)
+        self.assertEqual(root["citation"], [{"@id": "https://example.com/results"},
+                                            {"@id": "https://doi.org/10.5555/code"}])
+        graph = self.graph(out)
+        live = next(e for e in graph if e["@id"] == "https://example.com/results")
+        self.assertEqual(live["identifier"], "https://doi.org/10.5555/results")
+        code = next(e for e in graph if e["@id"] == "https://doi.org/10.5555/code")
+        self.assertEqual(code["@type"], "CreativeWork")
+        self.assertEqual(code["name"], "Simulation")
+        self.assertEqual(run(out, "--check").returncode, 0)
+
+    def test_bad_doi_and_a_second_doi_are_refused(self):
+        for bad, live in (("10.5555", None), ("https://example.org/10.5555/x", None),
+                          ("10.5555/one", "https://doi.org/10.5555/two")):
+            def change(d):
+                d["items"][1]["doi"] = bad
+                if live:
+                    d["items"][1]["live"] = live
+            self.edit_box(change)
+            r = run(self.box, "--for", "shareable", "--out", self.tmp / "never")
+            self.assertEqual(r.returncode, 1, bad)
+            self.assertIn("doi", r.stderr)
+            self.assertFalse((self.tmp / "never").exists())
+
+    def test_doi_matching_its_live_link_is_accepted(self):
+        def change(d):
+            d["items"][1]["live"] = "https://doi.org/10.5555/12345678"
+            d["items"][1]["doi"] = "10.5555/12345678"
+        self.edit_box(change)
+        out = self.drop()
+        self.assertEqual(self.root(out)["citation"],
+                         [{"@id": "https://doi.org/10.5555/12345678"}])
+
+    def test_check_reports_a_hand_edited_identifier(self):
+        self.edit_box(lambda d: (d.update(author_orcid=ORCID),
+                                 d["items"][1].update(doi="10.5555/x")))
+        out = self.drop("same-assistant")
+        self.assertEqual(run(out, "--check").returncode, 0)
+        for change in (lambda d: d.update(author_orcid="0000-0002-1825-0098"),
+                       lambda d: d["items"][0].update(doi="not-a-doi")):
+            work = self.tmp / "work"
+            if work.exists():
+                shutil.rmtree(work)
+            shutil.copytree(out, work)
+            self.edit_box(change, box=work)
+            # Rewrite the tag manifest, so only the identifier check can catch it.
+            (work / "tagmanifest-sha256.txt").write_text("".join(
+                f"{hashlib.sha256((work / n).read_bytes()).hexdigest()}  {n}\n"
+                for n in ("BOX.md", "box.json", "ro-crate-metadata.json",
+                          "manifest-sha256.txt")))
+            r = run(work, "--check")
+            self.assertEqual(r.returncode, 1, r.stdout)
+            self.assertIn("Malformed identifier in box.json", r.stdout)
+
+    def test_lookup_claims_include_author_orcid_and_item_doi(self):
+        box = {"author_ids": [{"scheme": "orcid", "id": ORCID}],
+               "author_orcid": f"https://orcid.org/{ORCID}",
+               "items": [{"item": "A", "live": "https://doi.org/10.5555/A", "doi": "10.5555/a"},
+                         {"item": "B", "doi": "doi:10.5555/b"}]}
+        self.assertEqual(self.bb.box_claims(box),
+                         [("orcid", ORCID, None), ("doi", "10.5555/A", "A"),
+                          ("doi", "10.5555/b", "B")])
+        box["author_ids"] = []
+        self.assertEqual(self.bb.box_claims(box)[0], ("orcid", ORCID, None))
+
+    def test_receipt_about_a_held_back_orcid_stays_with_it(self):
+        self.edit_box(lambda d: d.update(author_orcid=ORCID))
+        receipts = self.box / "receipts"
+        receipts.mkdir()
+        body = ORCID_PERSON
+        (receipts / "orcid.json").write_bytes(body)
+        index = {"type": "research-box-receipts/v1", "claim": "Registries do not sign.",
+                 "receipts": [{"claim": {"scheme": "orcid", "id": ORCID},
+                               "registry": "orcid-public-api",
+                               "url": f"https://pub.orcid.org/v3.0/{ORCID}/person",
+                               "asked": "2026-11-28T00:00:00+00:00", "status": 200,
+                               "response": "receipts/orcid.json",
+                               "response_sha256": hashlib.sha256(body).hexdigest(),
+                               "answer": {"found": True, "name": "Josiah Carberry"}}]}
+        (receipts / "receipts.json").write_text(json.dumps(index))
+        same = self.drop("same-assistant", "same")
+        self.assertTrue((same / "receipts" / "orcid.json").is_file())
+        share = self.drop("shareable", "share")
+        self.assertFalse((share / "receipts" / "orcid.json").exists())
+        self.assertNotIn(ORCID, (share / "receipts" / "receipts.json").read_text())
+        self.assertNotIn(ORCID, (share / "manifest-sha256.txt").read_text())
+
+    def test_boxes_without_the_fields_drop_byte_for_byte_as_before(self):
+        out = self.drop()
+        self.assertNotIn("citation", self.root(out))
+        self.assertNotIn("author_orcid", (out / "box.json").read_text())
+        self.assertIn({"@id": "#author"}, [self.root(out)["author"]])
+
+
 if __name__ == "__main__":
     unittest.main()
